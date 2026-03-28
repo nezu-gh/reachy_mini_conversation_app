@@ -79,10 +79,11 @@ async def main():
         EndFrame,
         InputAudioRawFrame,
         InterimTranscriptionFrame,
+        LLMTextFrame,
         OutputAudioRawFrame,
+        TextFrame,
         TranscriptionFrame,
         TTSAudioRawFrame,
-        TTSTextFrame,
         VADUserStartedSpeakingFrame,
         VADUserStoppedSpeakingFrame,
     )
@@ -122,7 +123,11 @@ async def main():
         settings=OpenAILLMService.Settings(
             model=LLM_MODEL,
             system_instruction="You are a friendly robot named R3-MN1. Keep responses to 1-2 sentences.",
-            extra={"extra_body": {"enable_thinking": False}},
+            extra={
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+            },
         ),
     )
     tts = OpenAITTSService(
@@ -135,10 +140,13 @@ async def main():
     context = LLMContext()
     user_agg, assistant_agg = LLMContextAggregatorPair(context)
 
-    # ---- Collector ----
+    # ---- Collectors ----
+    # Two collectors: one early (after STT, before LLM) to catch transcripts
+    # and VAD events, one late (after TTS) to catch LLM text and TTS audio.
     collected = {"transcripts": [], "llm_text": [], "tts_frames": 0, "tts_bytes": 0, "vad_events": []}
 
-    class Collector(FrameProcessor):
+    class EarlyCollector(FrameProcessor):
+        """Captures STT transcripts and VAD events (before user_agg)."""
         async def process_frame(self, frame, direction):
             await super().process_frame(frame, direction)
             if isinstance(frame, TranscriptionFrame):
@@ -146,12 +154,6 @@ async def main():
                 print(f"  [STT] {frame.text}")
             elif isinstance(frame, InterimTranscriptionFrame):
                 print(f"  [STT partial] {frame.text}")
-            elif isinstance(frame, TTSTextFrame):
-                collected["llm_text"].append(frame.text)
-                print(f"  [LLM→TTS] {frame.text}", end="", flush=True)
-            elif isinstance(frame, (OutputAudioRawFrame, TTSAudioRawFrame)):
-                collected["tts_frames"] += 1
-                collected["tts_bytes"] += len(frame.audio)
             elif isinstance(frame, VADUserStartedSpeakingFrame):
                 collected["vad_events"].append("start")
                 print("  [VAD] speech started")
@@ -160,9 +162,29 @@ async def main():
                 print("  [VAD] speech stopped")
             await self.push_frame(frame, direction)
 
-    collector = Collector()
+    class LLMCollector(FrameProcessor):
+        """Captures LLM text output (between LLM and TTS)."""
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+            if isinstance(frame, (TextFrame, LLMTextFrame)):
+                collected["llm_text"].append(frame.text)
+                print(f"  [LLM] {frame.text}", end="", flush=True)
+            await self.push_frame(frame, direction)
 
-    pipeline = Pipeline([vad, stt, user_agg, llm, collector, tts, assistant_agg])
+    class TTSCollector(FrameProcessor):
+        """Captures TTS audio (after TTS)."""
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+            if isinstance(frame, (OutputAudioRawFrame, TTSAudioRawFrame)):
+                collected["tts_frames"] += 1
+                collected["tts_bytes"] += len(frame.audio)
+            await self.push_frame(frame, direction)
+
+    early = EarlyCollector()
+    llm_col = LLMCollector()
+    tts_col = TTSCollector()
+
+    pipeline = Pipeline([vad, stt, early, user_agg, llm, llm_col, tts, tts_col, assistant_agg])
 
     task = PipelineTask(
         pipeline,

@@ -246,10 +246,14 @@ class PipecatProvider(ConversationProvider):
             settings=OpenAILLMService.Settings(
                 model=LLM_MODEL,
                 system_instruction=get_session_instructions(),
-                # Qwen3.5 is a thinking model — it streams reasoning_content
-                # first, then content.  Pipecat's OpenAILLMService only
-                # forwards delta.content to TTS, so thinking tokens are
-                # silently skipped.  Latency depends on thinking time.
+                # Disable thinking via chat_template_kwargs so the Jinja
+                # template pre-fills an empty <think>\n\n</think> block.
+                # This avoids the 30-90s thinking latency on Qwen3.5.
+                extra={
+                    "extra_body": {
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    },
+                },
             ),
         )
 
@@ -319,6 +323,26 @@ class PipecatProvider(ConversationProvider):
 
             def stop(self) -> None:
                 self._running = False
+
+        class ASRTextCleaner(FrameProcessor):
+            """Strips Qwen ASR prefix tags from transcription text.
+
+            Qwen3-ASR returns text like '<asr_text>Hello world.' — this
+            processor removes the prefix so the LLM sees clean text.
+            """
+
+            async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                if isinstance(frame, TranscriptionFrame):
+                    text = getattr(frame, "text", "")
+                    cleaned = text.replace("<asr_text>", "").strip()
+                    if cleaned != text:
+                        frame.text = cleaned
+                elif isinstance(frame, InterimTranscriptionFrame):
+                    text = getattr(frame, "text", "")
+                    cleaned = text.replace("<asr_text>", "").strip()
+                    if cleaned != text:
+                        frame.text = cleaned
+                await self.push_frame(frame, direction)
 
         class AssistantTextTap(FrameProcessor):
             """Taps LLM output text before it reaches TTS.
@@ -425,6 +449,7 @@ class PipecatProvider(ConversationProvider):
         # InputAudioRawFrame via task.queue_frame().
 
         source = PipelineSource()
+        asr_cleaner = ASRTextCleaner()
         text_tap = AssistantTextTap()
         sink = PipelineSink()
 
@@ -432,6 +457,7 @@ class PipecatProvider(ConversationProvider):
             [
                 vad,            # analyse audio for speech boundaries
                 stt,            # transcribe speech segments
+                asr_cleaner,    # strip <asr_text> prefix from Qwen ASR
                 user_agg,       # accumulate user turns
                 llm,            # generate response
                 text_tap,       # capture assistant text before TTS
