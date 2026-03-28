@@ -35,6 +35,17 @@ def main() -> None:
     run(args)
 
 
+def _build_handler(provider: str, deps: Any, gradio_mode: bool, instance_path: Any) -> Any:
+    """Factory that returns the appropriate conversation handler for *provider*."""
+    if provider == "pipecat":
+        from reachy_mini_conversation_app.providers.pipecat_provider import PipecatProvider
+
+        return PipecatProvider(deps, gradio_mode=gradio_mode, instance_path=instance_path)
+    from reachy_mini_conversation_app.providers.openai_provider import OpenAIProvider
+
+    return OpenAIProvider(deps, gradio_mode=gradio_mode, instance_path=instance_path)
+
+
 def run(
     args: argparse.Namespace,
     robot: ReachyMini = None,
@@ -138,7 +149,7 @@ def run(
     )
     logger.debug(f"Chatbot avatar images: {chatbot.avatar_images}")
 
-    handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
+    handler = _build_handler(getattr(args, "provider", "openai"), deps, args.gradio, instance_path)
 
     stream_manager: gr.Blocks | LocalStream | None = None
 
