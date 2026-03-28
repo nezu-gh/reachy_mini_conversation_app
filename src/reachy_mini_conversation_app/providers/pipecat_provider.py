@@ -335,10 +335,13 @@ class PipecatProvider(ConversationProvider):
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
                 # TTS audio → output queue + head wobbler
+                # While the robot is speaking, suppress listening so
+                # idle breathing is allowed and antennas aren't frozen.
                 if isinstance(frame, (OutputAudioRawFrame, TTSAudioRawFrame)):
                     audio_bytes = frame.audio
                     sr = frame.sample_rate
 
+                    provider_ref.deps.movement_manager.set_listening(False)
                     provider_ref.last_activity_time = asyncio.get_event_loop().time()
 
                     # Convert raw PCM bytes → int16 numpy
@@ -373,7 +376,9 @@ class PipecatProvider(ConversationProvider):
                             AdditionalOutputs({"role": "user_partial", "content": text})
                         )
 
-                # VAD speech boundaries → listening mode for movement manager
+                # VAD speech boundaries → listening mode for movement manager.
+                # The robot should always be listening when idle — only
+                # TTS playback (above) temporarily clears the flag.
                 elif isinstance(frame, VADUserStartedSpeakingFrame):
                     provider_ref.deps.movement_manager.set_listening(True)
                     if provider_ref.deps.head_wobbler is not None:
@@ -392,8 +397,11 @@ class PipecatProvider(ConversationProvider):
                     logger.debug("User speech started (barge-in)")
 
                 elif isinstance(frame, VADUserStoppedSpeakingFrame):
-                    provider_ref.deps.movement_manager.set_listening(False)
-                    logger.debug("User speech stopped")
+                    # Stay in listening mode — robot remains attentive
+                    # between utterances.  Listening is only cleared
+                    # while TTS audio is actively playing.
+                    provider_ref.deps.movement_manager.set_listening(True)
+                    logger.debug("User speech stopped (still listening)")
 
                 # TODO: capture FunctionCallResultFrame for tool call
                 # dispatch once tools are registered with the LLM.
@@ -462,7 +470,11 @@ class PipecatProvider(ConversationProvider):
                 logger.exception("PipecatProvider pipeline crashed")
 
         self._runner_task = asyncio.create_task(_run(), name="pipecat-pipeline")
-        logger.info("PipecatProvider: pipeline started")
+
+        # Robot should be attentive from the start — always listening
+        # unless actively speaking.
+        self.deps.movement_manager.set_listening(True)
+        logger.info("PipecatProvider: pipeline started (listening)")
 
     async def shutdown(self) -> None:
         """Stop the pipecat pipeline gracefully."""
