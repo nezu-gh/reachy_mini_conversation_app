@@ -1,0 +1,8 @@
+dance
+stop_dance
+play_emotion
+stop_emotion
+move_head
+camera
+do_nothing
+# head_tracking is commented out — CPU-intensive on local hardware
