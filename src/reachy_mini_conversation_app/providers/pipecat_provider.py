@@ -9,8 +9,8 @@ running three OpenAI-compatible ``/v1`` Docker services on a local VM:
   VAD : SileroVADAnalyzer (runs locally, no endpoint)
 
 Audio flows:
-  fastrtc receive() → _audio_in_queue → PipelineSource → [STT → LLM → TTS]
-                                                                      ↓
+  fastrtc receive() → _audio_in_queue → PipelineSource → [VAD → STT → LLM → TTS]
+                                                                              ↓
   fastrtc emit()    ← _output_queue  ← PipelineSink  ←  audio + transcripts
 
 Speech energy for head-wobble is fed from TTS output audio into HeadWobbler
@@ -64,9 +64,8 @@ ASR_MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
 # ---------------------------------------------------------------------------
 # Audio constants
 # ---------------------------------------------------------------------------
-# fastrtc uses 24 kHz; pipecat's Silero VAD requires 16 kHz internally but
-# services negotiate their own sample rates.  We operate the pipeline at
-# 16 kHz and resample at the boundary.
+# fastrtc uses 24 kHz; pipecat's Silero VAD requires 16 kHz.
+# PipelineParams defaults already match: audio_in=16000, audio_out=24000.
 FASTRTC_SAMPLE_RATE = 24000
 PIPELINE_SAMPLE_RATE = 16000
 
@@ -108,6 +107,7 @@ class PipecatProvider(ConversationProvider):
         # Lifecycle
         self._pipeline_task: Any | None = None
         self._runner_task: asyncio.Task[None] | None = None
+        self._source: Any | None = None
         self.last_activity_time: float = 0.0
         self.start_time: float = 0.0
 
@@ -193,15 +193,14 @@ class PipecatProvider(ConversationProvider):
     async def start_up(self) -> None:
         """Build and start the pipecat pipeline."""
         from pipecat.frames.frames import (
-            LLMRunFrame,
             TTSTextFrame,
             TTSAudioRawFrame,
             InputAudioRawFrame,
             TranscriptionFrame,
             OutputAudioRawFrame,
-            UserStartedSpeakingFrame,
-            UserStoppedSpeakingFrame,
             InterimTranscriptionFrame,
+            VADUserStartedSpeakingFrame,
+            VADUserStoppedSpeakingFrame,
         )
         from pipecat.pipeline.task import PipelineTask, PipelineParams
         from pipecat.pipeline.runner import PipelineRunner
@@ -211,9 +210,9 @@ class PipecatProvider(ConversationProvider):
         from pipecat.services.openai.stt import OpenAISTTService
         from pipecat.services.openai.tts import OpenAITTSService
         from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+        from pipecat.processors.audio.vad_processor import VADProcessor
         from pipecat.processors.aggregators.llm_context import LLMContext
         from pipecat.processors.aggregators.llm_response_universal import (
-            LLMUserAggregatorParams,
             LLMContextAggregatorPair,
         )
 
@@ -250,11 +249,22 @@ class PipecatProvider(ConversationProvider):
             ),
         )
 
+        # OpenAI TTS always outputs 24 kHz.  Our Qwen3-TTS endpoint is
+        # OpenAI-compatible, so it also outputs 24 kHz — no resampling
+        # needed between TTS output and the fastrtc contract.
         tts = OpenAITTSService(
             api_key="not-needed",
             base_url=TTS_BASE_URL,
             model=TTS_MODEL,
-            sample_rate=PIPELINE_SAMPLE_RATE,
+        )
+
+        # ---- VAD ---------------------------------------------------------
+        # Standalone VADProcessor generates VADUserStartedSpeakingFrame /
+        # VADUserStoppedSpeakingFrame that both the STT service and the
+        # user aggregator listen for.
+
+        vad = VADProcessor(
+            vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE),
         )
 
         # ---- Tool registration (deferred) --------------------------------
@@ -264,16 +274,11 @@ class PipecatProvider(ConversationProvider):
 
         # ---- Context & aggregators ---------------------------------------
 
-        instructions = get_session_instructions()
         context = LLMContext()
-        context.add_message({"role": "developer", "content": instructions})
 
-        user_agg, assistant_agg = LLMContextAggregatorPair(
-            context,
-            user_params=LLMUserAggregatorParams(
-                vad_analyzer=SileroVADAnalyzer(),
-            ),
-        )
+        # No vad_analyzer in user_params — the standalone VADProcessor
+        # already broadcasts VAD frames into the pipeline.
+        user_agg, assistant_agg = LLMContextAggregatorPair(context)
 
         # ---- Bridge processors -------------------------------------------
         # PipelineSource: pulls from _audio_in_queue, emits InputAudioRawFrame
@@ -339,7 +344,8 @@ class PipecatProvider(ConversationProvider):
                     # Convert raw PCM bytes → int16 numpy
                     pcm = np.frombuffer(audio_bytes, dtype=np.int16)
 
-                    # Resample from pipeline rate → fastrtc 24 kHz
+                    # Resample to fastrtc 24 kHz if needed (TTS should
+                    # already output 24 kHz, but handle mismatches).
                     if sr != FASTRTC_SAMPLE_RATE:
                         n_out = int(len(pcm) * FASTRTC_SAMPLE_RATE / sr)
                         pcm = resample(pcm, n_out).astype(np.int16)
@@ -368,13 +374,24 @@ class PipecatProvider(ConversationProvider):
                         )
 
                 # VAD speech boundaries → listening mode for movement manager
-                elif isinstance(frame, UserStartedSpeakingFrame):
+                elif isinstance(frame, VADUserStartedSpeakingFrame):
                     provider_ref.deps.movement_manager.set_listening(True)
                     if provider_ref.deps.head_wobbler is not None:
                         provider_ref.deps.head_wobbler.reset()
-                    logger.debug("User speech started")
+                    # Barge-in: drain pending audio so the robot stops
+                    # talking when the user interrupts.
+                    while not provider_ref.output_queue.empty():
+                        try:
+                            item = provider_ref.output_queue.get_nowait()
+                            if isinstance(item, AdditionalOutputs):
+                                # Keep transcript outputs, discard audio
+                                await provider_ref.output_queue.put(item)
+                                break
+                        except asyncio.QueueEmpty:
+                            break
+                    logger.debug("User speech started (barge-in)")
 
-                elif isinstance(frame, UserStoppedSpeakingFrame):
+                elif isinstance(frame, VADUserStoppedSpeakingFrame):
                     provider_ref.deps.movement_manager.set_listening(False)
                     logger.debug("User speech stopped")
 
@@ -386,9 +403,14 @@ class PipecatProvider(ConversationProvider):
                 await self.push_frame(frame, direction)
 
         # ---- Assemble pipeline -------------------------------------------
-        # No pipecat transport needed — PipelineSource feeds audio in via
-        # task.queue_frame() and PipelineSink catches output frames and
-        # bridges them to the fastrtc output_queue.
+        # PipelineTask._process_push_queue() sends StartFrame automatically
+        # with audio_in/out sample rates from PipelineParams.
+        #
+        # Pipeline order:
+        #   VAD → STT → user_agg → LLM → text_tap → TTS → sink → assistant_agg
+        #
+        # PipelineSource runs as a separate asyncio task and injects
+        # InputAudioRawFrame via task.queue_frame().
 
         source = PipelineSource()
         text_tap = AssistantTextTap()
@@ -396,19 +418,23 @@ class PipecatProvider(ConversationProvider):
 
         pipeline = Pipeline(
             [
-                stt,
-                user_agg,
-                llm,
-                text_tap,  # capture assistant text before TTS
-                tts,
-                sink,  # capture TTS audio + transcripts → fastrtc
-                assistant_agg,
+                vad,            # analyse audio for speech boundaries
+                stt,            # transcribe speech segments
+                user_agg,       # accumulate user turns
+                llm,            # generate response
+                text_tap,       # capture assistant text before TTS
+                tts,            # synthesise speech
+                sink,           # bridge audio + transcripts → fastrtc
+                assistant_agg,  # accumulate assistant turns
             ]
         )
 
         task = PipelineTask(
             pipeline,
             params=PipelineParams(
+                allow_interruptions=True,
+                audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+                audio_out_sample_rate=FASTRTC_SAMPLE_RATE,
                 enable_metrics=True,
                 enable_usage_metrics=True,
             ),
@@ -437,10 +463,6 @@ class PipecatProvider(ConversationProvider):
 
         self._runner_task = asyncio.create_task(_run(), name="pipecat-pipeline")
         logger.info("PipecatProvider: pipeline started")
-
-        # Push an initial greeting prompt
-        context.add_message({"role": "developer", "content": "Please introduce yourself to the user."})
-        await task.queue_frames([LLMRunFrame()])
 
     async def shutdown(self) -> None:
         """Stop the pipecat pipeline gracefully."""
