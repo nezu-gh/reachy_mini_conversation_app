@@ -1,6 +1,7 @@
 """OpenAI Realtime provider — thin bridge to OpenaiRealtimeHandler."""
-from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler
+
 from reachy_mini_conversation_app.providers.base import ConversationProvider
+from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler
 
 
 class OpenAIProvider(OpenaiRealtimeHandler, ConversationProvider):

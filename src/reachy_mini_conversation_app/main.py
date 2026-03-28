@@ -36,7 +36,7 @@ def main() -> None:
 
 
 def _build_handler(provider: str, deps: Any, gradio_mode: bool, instance_path: Any) -> Any:
-    """Factory that returns the appropriate conversation handler for *provider*."""
+    """Return the appropriate conversation handler for *provider*."""
     if provider == "pipecat":
         from reachy_mini_conversation_app.providers.pipecat_provider import PipecatProvider
 
@@ -57,7 +57,6 @@ def run(
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
     from reachy_mini_conversation_app.moves import MovementManager
     from reachy_mini_conversation_app.console import LocalStream
-    from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler
     from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
     from reachy_mini_conversation_app.audio.head_wobbler import HeadWobbler
 

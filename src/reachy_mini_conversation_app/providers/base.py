@@ -1,6 +1,6 @@
 """Base class for conversation providers."""
-from __future__ import annotations
 
+from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
@@ -27,6 +27,7 @@ class ConversationProvider(AsyncStreamHandler, ABC):
 
         Returns:
             A short status message for UI feedback.
+
         """
 
     @abstractmethod
@@ -41,6 +42,7 @@ class ConversationProvider(AsyncStreamHandler, ABC):
 
         Args:
             idle_duration: Seconds since the last interaction.
+
         """
 
     def get_tool_specs_override(self) -> Optional[List[dict]]:
