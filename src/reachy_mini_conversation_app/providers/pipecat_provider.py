@@ -5,15 +5,16 @@ All heavy imports are guarded by a try/except so the module can be imported
 even when pipecat-ai is not installed; a RuntimeError is raised at
 instantiation time instead.
 
+All three backends run as Docker containers on a local VM and expose
+OpenAI-compatible ``/v1`` endpoints.  Default URLs are configured via
+environment variables (see ``_DEFAULT_*`` constants below).
+
 Local pipeline design (TODOs — not yet wired):
-  STT : Kyutai Moshi (MoshiSTTService) — preferred
-        WhisperSTTService (faster-whisper) as CPU fallback
-  LLM : OLLamaLLMService with MODEL_NAME env var (default: qwen3:8b)
-        or any OpenAI-compat endpoint via base_url
-  TTS : Qwen3-TTS via a custom pipecat service wrapper
-        KokoroTTSService as fallback
-  VAD : SileroVADAnalyzer
-  Tools: dispatch_tool_call_with_manager() via FunctionCallProcessor
+  STT : Qwen-ASR via OpenAI-compat /v1 endpoint (ASR_BASE_URL)
+  LLM : Qwen3.5-35B-A3B via ik-llama.cpp /v1 endpoint (LLM_BASE_URL)
+  TTS : Qwen3-TTS via OpenAI-compat /v1 endpoint (TTS_BASE_URL)
+  VAD : SileroVADAnalyzer (local, no endpoint)
+  Tools: dispatch_tool_call_with_manager() via Pipecat FunctionCallProcessor
   Audio: pipecat native 16 kHz → fastrtc contract 24 kHz resampling
 """
 from __future__ import annotations
@@ -39,7 +40,15 @@ try:
 except ImportError:
     _PIPECAT_AVAILABLE = False
 
-MODEL_NAME = os.environ.get("MODEL_NAME", "qwen3:8b")
+# Default VM IP and endpoints (override via env vars)
+_DEFAULT_VM = "192.168.178.155"
+
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", f"http://{_DEFAULT_VM}:3443/v1")
+LLM_MODEL = os.environ.get("MODEL_NAME", "qwen3:8b")
+
+TTS_BASE_URL = os.environ.get("TTS_BASE_URL", f"http://{_DEFAULT_VM}:7034/v1")
+ASR_BASE_URL = os.environ.get("ASR_BASE_URL", f"http://{_DEFAULT_VM}:8015/v1")
+
 LOCAL_VISION_MODEL = os.environ.get("LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
 
 
@@ -86,7 +95,7 @@ class PipecatProvider(ConversationProvider):
     async def get_available_voices(self) -> List[str]:
         """Return voices available from the local TTS engine.
 
-        TODO: query KokoroTTSService / Qwen3-TTS for available voice IDs.
+        TODO: query Qwen3-TTS at TTS_BASE_URL for available voice IDs.
         """
         logger.warning("PipecatProvider.get_available_voices: not yet implemented")
         return []
@@ -120,9 +129,9 @@ class PipecatProvider(ConversationProvider):
 
         TODO:
         - Instantiate SileroVADAnalyzer
-        - Instantiate STT (MoshiSTTService or WhisperSTTService fallback)
-        - Instantiate LLM (OLLamaLLMService, model=MODEL_NAME)
-        - Instantiate TTS (Qwen3-TTS wrapper or KokoroTTSService fallback)
+        - Instantiate STT via OpenAI-compat client → ASR_BASE_URL (Qwen-ASR)
+        - Instantiate LLM via OpenAI-compat client → LLM_BASE_URL (Qwen3.5-35B, model=LLM_MODEL)
+        - Instantiate TTS via OpenAI-compat client → TTS_BASE_URL (Qwen3-TTS)
         - Wire FunctionCallProcessor with dispatch_tool_call_with_manager()
         - Build and start pipecat Pipeline
         """
