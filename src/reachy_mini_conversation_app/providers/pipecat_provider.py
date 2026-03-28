@@ -246,7 +246,10 @@ class PipecatProvider(ConversationProvider):
             settings=OpenAILLMService.Settings(
                 model=LLM_MODEL,
                 system_instruction=get_session_instructions(),
-                extra={"extra_body": {"enable_thinking": False}},
+                # Qwen3.5 is a thinking model — it streams reasoning_content
+                # first, then content.  Pipecat's OpenAILLMService only
+                # forwards delta.content to TTS, so thinking tokens are
+                # silently skipped.  Latency depends on thinking time.
             ),
         )
 
