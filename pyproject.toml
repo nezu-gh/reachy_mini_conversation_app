@@ -31,6 +31,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+local_pipeline = [
+    "pipecat-ai[silero,whisper,ollama,kokoro]>=0.0.49",
+    "fastmcp>=2.0.0",
+]
 local_vision = [
   "accelerate>=1.13.0",
   "torch>=2.1",
