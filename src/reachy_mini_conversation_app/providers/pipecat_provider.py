@@ -53,13 +53,13 @@ except ImportError:
 _DEFAULT_VM = os.environ.get("LOCAL_VM_IP", "192.168.178.155")
 
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", f"http://{_DEFAULT_VM}:3443/v1")
-LLM_MODEL = os.environ.get("MODEL_NAME", "qwen3:8b")
+LLM_MODEL = os.environ.get("MODEL_NAME", "qwen3.5-35b-a3b")
 
 TTS_BASE_URL = os.environ.get("TTS_BASE_URL", f"http://{_DEFAULT_VM}:7034/v1")
 TTS_MODEL = os.environ.get("TTS_MODEL", "tts-1")
 
 ASR_BASE_URL = os.environ.get("ASR_BASE_URL", f"http://{_DEFAULT_VM}:8015/v1")
-ASR_MODEL = os.environ.get("ASR_MODEL", "whisper-1")
+ASR_MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
 
 # ---------------------------------------------------------------------------
 # Audio constants

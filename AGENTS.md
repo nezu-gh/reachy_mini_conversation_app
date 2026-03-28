@@ -30,6 +30,17 @@ Realtime path must remain intact as default/fallback.
 - Local inference endpoints defined in `.env.r3mn1`
 - The local VM IP is set via `LOCAL_VM_IP` env var (default: 192.168.178.155)
 
+## Infrastructure
+
+| Service | IP / URL | Notes |
+|---|---|---|
+| Inference VM | 192.168.178.155 | Hosts all AI Docker containers |
+| LLM — ik-llama.cpp | :3443/v1 | Qwen3.5-35B-A3B-IQ4_XS |
+| ASR — qwen-asr (vLLM) | :8015/v1 | Qwen3-ASR |
+| TTS — Qwen3-TTS-Openai-Fastapi | :7034/v1 | qwen3-tts / tts-1 |
+| Reachy Mini | 192.168.178.127 | Robot daemon |
+| Home Assistant | 192.168.178.77:8123 | HA instance |
+
 ## Architecture
 
 ```
