@@ -53,13 +53,13 @@ except ImportError:
 _DEFAULT_VM = os.environ.get("LOCAL_VM_IP", "192.168.178.155")
 
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", f"http://{_DEFAULT_VM}:3443/v1")
-LLM_MODEL = os.environ.get("MODEL_NAME", "qwen3.5-35b-a3b")
+LLM_MODEL = os.environ.get("MODEL_NAME", "/models/Qwen3.5-35B-A3B-GGUF/IQ4_XS/Qwen3.5-35B-A3B-IQ4_XS-00001-of-00002.gguf")
 
 TTS_BASE_URL = os.environ.get("TTS_BASE_URL", f"http://{_DEFAULT_VM}:7034/v1")
-TTS_MODEL = os.environ.get("TTS_MODEL", "tts-1")
+TTS_MODEL = os.environ.get("TTS_MODEL", "qwen3-tts")
 
 ASR_BASE_URL = os.environ.get("ASR_BASE_URL", f"http://{_DEFAULT_VM}:8015/v1")
-ASR_MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
+ASR_MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
 
 # ---------------------------------------------------------------------------
 # Audio constants
@@ -246,6 +246,7 @@ class PipecatProvider(ConversationProvider):
             settings=OpenAILLMService.Settings(
                 model=LLM_MODEL,
                 system_instruction=get_session_instructions(),
+                extra={"extra_body": {"enable_thinking": False}},
             ),
         )
 
