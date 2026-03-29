@@ -242,12 +242,10 @@ class LocalStream:
         class ApiKeyPayload(BaseModel):
             openai_api_key: str
 
-        # GET / -> dashboard.html
-        dashboard_file = static_dir / "dashboard.html"
-
+        # GET / -> index.html (base class may already serve this)
         @self._settings_app.get("/")
         def _root() -> FileResponse:
-            return FileResponse(str(dashboard_file))
+            return FileResponse(str(index_file))
 
         # GET /favicon.ico -> optional, avoid noisy 404s on some browsers
         @self._settings_app.get("/favicon.ico")
@@ -304,6 +302,12 @@ class LocalStream:
             except Exception as e:
                 logger.warning(f"API key validation failed: {e}")
                 return JSONResponse({"valid": False, "error": "validation_error"}, status_code=500)
+
+        # Mount dashboard API routes (health, logs SSE, config, controls)
+        try:
+            mount_dashboard_routes(self._settings_app, self.handler)
+        except Exception:
+            pass
 
         self._settings_initialized = True
 
@@ -404,7 +408,6 @@ class LocalStream:
                         persist_personality=self._persist_personality,
                         get_persisted_personality=self._read_persisted_personality,
                     )
-                    mount_dashboard_routes(self._settings_app, self.handler)
             except Exception:
                 pass
             self._tasks = [

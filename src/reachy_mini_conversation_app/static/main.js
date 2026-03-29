@@ -185,7 +185,7 @@ function show(el, flag) {
 
 async function init() {
   const loading = document.getElementById("loading");
-  show(loading, true);
+  if (loading) show(loading, true);
   const statusEl = document.getElementById("status");
   const formPanel = document.getElementById("form-panel");
   const configuredPanel = document.getElementById("configured");
@@ -280,7 +280,7 @@ async function init() {
   if (!st.has_key) {
     statusEl.textContent = "";
     show(formPanel, true);
-    show(loading, false);
+    if (loading) show(loading, false);
     return;
   }
 
@@ -291,7 +291,7 @@ async function init() {
   if (!list.choices.length) {
     statusEl.textContent = "Personality endpoints not ready yet. Retry shortly.";
     statusEl.className = "status warn";
-    show(loading, false);
+    if (loading) show(loading, false);
     return;
   }
 
@@ -493,7 +493,7 @@ async function init() {
     statusEl.className = "status warn";
   } finally {
     // Hide loading when initial setup is done (regardless of key presence)
-    show(loading, false);
+    if (loading) show(loading, false);
   }
 }
 
