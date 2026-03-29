@@ -876,6 +876,8 @@ class PipecatProvider(ConversationProvider):
                     sr = frame.sample_rate
 
                     provider_ref.deps.movement_manager.set_listening(False)
+                    if provider_ref._doa_tracker is not None:
+                        provider_ref._doa_tracker.set_enabled(False)
                     provider_ref.last_activity_time = asyncio.get_event_loop().time()
 
                     # Convert raw PCM bytes → int16 numpy and boost volume.
@@ -926,6 +928,8 @@ class PipecatProvider(ConversationProvider):
                     provider_ref.deps.movement_manager.set_listening(True)
                     if provider_ref.deps.head_wobbler is not None:
                         provider_ref.deps.head_wobbler.reset()
+                    if provider_ref._doa_tracker is not None:
+                        provider_ref._doa_tracker.set_enabled(True)
                     # Barge-in: drain ALL pending audio from the output
                     # queue so the robot stops talking immediately.
                     # Preserve transcript AdditionalOutputs (non-audio).
@@ -1061,10 +1065,28 @@ class PipecatProvider(ConversationProvider):
         # Robot should be attentive from the start — always listening
         # unless actively speaking.
         self.deps.movement_manager.set_listening(True)
+
+        # DoA speaker tracking (opt-in via ENABLE_DOA_TRACKING=1)
+        self._doa_tracker = None
+        if os.environ.get("ENABLE_DOA_TRACKING", "0") == "1":
+            try:
+                from reachy_mini_conversation_app.audio.doa_tracker import DoATracker
+
+                self._doa_tracker = DoATracker(
+                    robot=self.deps.reachy_mini,
+                    set_offsets=self.deps.movement_manager.set_speech_offsets,
+                )
+                self._doa_tracker.start()
+            except Exception as exc:
+                logger.warning("DoA tracker init failed: %s", exc)
+
         logger.info("PipecatProvider: pipeline started (listening)")
 
     async def shutdown(self) -> None:
         """Stop the pipecat pipeline gracefully."""
+        if getattr(self, "_doa_tracker", None) is not None:
+            self._doa_tracker.stop()
+
         if self._source is not None:
             self._source.stop()
 
