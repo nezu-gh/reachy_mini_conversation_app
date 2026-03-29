@@ -14,7 +14,9 @@ tags:
 
 # Reachy Mini conversation app
 
-Conversational app for the Reachy Mini robot combining OpenAI's realtime APIs, vision pipelines, and choreographed motion libraries.
+Conversational app for the Reachy Mini robot combining real-time AI pipelines, vision, and choreographed motion libraries.
+
+This fork adds a **local pipeline provider** (pipecat-ai) that runs speech-to-text, LLM, and text-to-speech on self-hosted OpenAI-compatible endpoints — no cloud API keys required. It also includes ASR noise filtering, context management, service health probes, procedural micro-expression sounds, Direction of Arrival speaker tracking, and a systemd service for unattended operation on Raspberry Pi.
 
 ![Reachy Mini Dance](docs/assets/reachy_mini_dance.gif)
 
@@ -24,8 +26,10 @@ Conversational app for the Reachy Mini robot combining OpenAI's realtime APIs, v
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Running the app](#running-the-app)
+- [Local pipeline provider](#local-pipeline-provider)
 - [LLM tools](#llm-tools-exposed-to-the-assistant)
 - [Advanced features](#advanced-features)
+- [Deployment](#deployment)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -108,6 +112,7 @@ Some wheels (like PyTorch) are large and require compatible CUDA or CPU builds�
 
 | Extra | Purpose | Notes |
 |-------|---------|-------|
+| `local_pipeline` | Pipecat-ai local conversation provider (STT/LLM/TTS via OpenAI-compatible endpoints) | See [Local pipeline provider](#local-pipeline-provider). |
 | `local_vision` | Run the local VLM (SmolVLM2) through PyTorch/Transformers | GPU recommended. Ensure compatible PyTorch builds for your platform. |
 | `yolo_vision` | YOLOv11n face detection via `ultralytics` and `supervision` | Used as the `yolo` head-tracking backend. Runs on CPU (default). GPU improves performance. |
 | `mediapipe_vision` | Lightweight landmark tracking with MediaPipe | Works on CPU. Enables `--head-tracker mediapipe`. |
@@ -128,6 +133,12 @@ Some wheels (like PyTorch) are large and require compatible CUDA or CPU builds�
 | `HF_HOME` | Cache directory for local Hugging Face downloads (only used with `--local-vision` flag, defaults to `./cache`). |
 | `HF_TOKEN` | Optional token for Hugging Face access (for gated/private assets). |
 | `LOCAL_VISION_MODEL` | Hugging Face model path for local vision processing (only used with `--local-vision` flag, defaults to `HuggingFaceTB/SmolVLM2-2.2B-Instruct`). |
+| `PROVIDER` | Conversation provider: `openai_realtime` (default) or `pipecat`. |
+| `LOCAL_VM_IP` | IP of the machine running STT/LLM/TTS services (used when `PROVIDER=pipecat`). |
+| `ASR_BASE_URL` | STT endpoint (default `http://{LOCAL_VM_IP}:8015/v1`). |
+| `LLM_BASE_URL` | LLM endpoint (default `http://{LOCAL_VM_IP}:3443/v1`). |
+| `TTS_BASE_URL` | TTS endpoint (default `http://{LOCAL_VM_IP}:7034/v1`). |
+| `ENABLE_DOA_TRACKING` | Set to `1` to enable Direction of Arrival speaker tracking (requires ReSpeaker mic array). |
 
 ## Running the app
 
@@ -175,6 +186,27 @@ reachy-mini-conversation-app --gradio
 > [!WARNING]
 > `--local-vision` is not supported when running the conversation app directly on Reachy Mini Wireless / the Raspberry Pi. For local vision, keep the daemon running on the robot and start the conversation app from your laptop or workstation instead.
 
+## Local pipeline provider
+
+The `pipecat` provider runs a full conversation pipeline using self-hosted OpenAI-compatible services — no cloud API required. It uses [pipecat-ai](https://github.com/pipecat-ai/pipecat) to orchestrate VAD, STT, LLM, and TTS.
+
+```bash
+uv sync --extra local_pipeline
+PROVIDER=pipecat LOCAL_VM_IP=192.168.1.100 reachy-mini-conversation-app
+```
+
+**Pipeline:** `Silero VAD → STT → ASR filter → Context trimmer → LLM → TTS → Audio output`
+
+### Features
+
+- **ASR noise filtering** — Filters hallucinated CJK characters and noise from Qwen-ASR (short utterances, punctuation-only, non-alphanumeric input).
+- **Context sliding window** — Keeps system messages plus the last 40 conversation turns, preventing LLM context overflow on long sessions.
+- **Tool result truncation** — Caps tool call results at 4 KB to prevent context bloat from large outputs.
+- **Service health probes** — Background thread checks STT/LLM/TTS availability at startup with retry logic (3 attempts, 2s backoff). Logs warnings but does not block startup.
+- **TTS warm-up** — Background request primes the TTS model to eliminate first-utterance latency.
+- **Micro-expression sounds** — Procedural audio cues (happy, sad, thinking, surprised, etc.) played via the `micro_expression` tool. Sounds are generated algorithmically with no WAV files required, but can be overridden by placing WAV files in a `sounds/` directory.
+- **DoA speaker tracking** — When `ENABLE_DOA_TRACKING=1` is set and a ReSpeaker mic array is connected, the robot's head gently orients toward the speaker using Direction of Arrival readings. Smoothed with an exponential moving average, clamped to ±15 degrees.
+
 ## LLM tools exposed to the assistant
 
 | Tool | Action | Dependencies |
@@ -187,6 +219,7 @@ reachy-mini-conversation-app --gradio
 | `play_emotion` | Play a recorded emotion clip via Hugging Face datasets. | Core install only. Uses the default open emotions dataset: [`pollen-robotics/reachy-mini-emotions-library`](https://huggingface.co/datasets/pollen-robotics/reachy-mini-emotions-library). |
 | `stop_emotion` | Clear queued emotions. | Core install only. |
 | `do_nothing` | Explicitly remain idle. | Core install only. |
+| `micro_expression` | Play a short procedural sound cue (happy, sad, thinking, surprised, etc.). | `local_pipeline` extra. Pipecat provider only. |
 
 ## Advanced features
 
@@ -307,6 +340,32 @@ reachy-mini-conversation-app --robot-name <name>
 ```
 
 `<name>` must match the daemon's `--robot-name` value so the app connects to the correct robot.
+
+</details>
+
+## Deployment
+
+<details>
+<summary><b>systemd service (Raspberry Pi)</b></summary>
+
+For unattended operation on a Raspberry Pi, install the app as a systemd service with automatic restart on crash:
+
+```bash
+# Install the service (creates reachy-mini-conversation.service)
+sudo ./scripts/install-service.sh
+
+# Manage the service
+sudo systemctl start reachy-mini-conversation
+sudo systemctl stop reachy-mini-conversation
+sudo systemctl status reachy-mini-conversation
+journalctl -u reachy-mini-conversation -f  # follow logs
+```
+
+The service runs `scripts/launcher.sh`, which:
+- Loads environment from `.env`
+- Waits for the Reachy Mini daemon to be reachable
+- Launches the conversation app with the configured `PROVIDER`
+- Restarts automatically on failure (5-second delay)
 
 </details>
 
