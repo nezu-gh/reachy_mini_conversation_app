@@ -66,14 +66,21 @@ def initialize_camera_and_vision(
 
     if not args.no_camera:
         if args.head_tracker is not None:
-            if args.head_tracker == "yolo":
-                from reachy_mini_conversation_app.vision.yolo_head_tracker import HeadTracker
+            try:
+                if args.head_tracker == "yolo":
+                    from reachy_mini_conversation_app.vision.yolo_head_tracker import HeadTracker
 
-                head_tracker = HeadTracker()
-            elif args.head_tracker == "mediapipe":
-                from reachy_mini_toolbox.vision import HeadTracker  # type: ignore[no-redef]
+                    head_tracker = HeadTracker()
+                elif args.head_tracker == "mediapipe":
+                    from reachy_mini_toolbox.vision import HeadTracker  # type: ignore[no-redef]
 
-                head_tracker = HeadTracker()
+                    head_tracker = HeadTracker()
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "Head tracker '%s' failed to initialize: %s — continuing without tracking",
+                    args.head_tracker,
+                    e,
+                )
 
         camera_worker = CameraWorker(current_robot, head_tracker)
 

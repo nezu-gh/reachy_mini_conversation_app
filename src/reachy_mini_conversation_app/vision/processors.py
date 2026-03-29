@@ -160,6 +160,12 @@ class VisionProcessor:
                     if attempt < self.vision_config.max_retries - 1:
                         time.sleep(self.vision_config.retry_delay * (attempt + 1))
                         continue
+                    # Final attempt — release per-inference allocations
+                    if self.device == "cuda":
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
                     return "GPU out of memory - vision processing failed"
 
                 logger.error("Vision processing failed (attempt %s): %s", attempt + 1, e)

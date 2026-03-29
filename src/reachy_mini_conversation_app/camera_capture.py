@@ -9,6 +9,7 @@ from the daemon's camera IPC socket.
 """
 
 import logging
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -48,12 +49,17 @@ def capture_frame(timeout: float = 5.0) -> Optional[npt.NDArray[np.uint8]]:
     pipeline = _GST_PIPELINE.format(output=output_path)
 
     try:
+        # Strip daemon's GST_* env vars to prevent ABI mismatch (upstream SDK issue #999)
+        clean_env = {k: v for k, v in os.environ.items() if not k.startswith("GST_")}
+        clean_env["GST_REGISTRY_FORK_DISABLE"] = "yes"
+
         result = subprocess.run(
             ["gst-launch-1.0", "-e"] + pipeline.split(),
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
+            env=clean_env,
         )
 
         if result.returncode != 0:

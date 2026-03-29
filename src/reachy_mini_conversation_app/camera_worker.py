@@ -115,7 +115,7 @@ class CameraWorker:
                 if frame is not None:
                     # Thread-safe frame storage
                     with self.frame_lock:
-                        self.latest_frame = frame  # .copy()
+                        self.latest_frame = frame.copy()
 
                     # Check if face tracking was just disabled
                     if self.previous_head_tracking_state and not self.is_head_tracking_enabled:
@@ -171,11 +171,9 @@ class CameraWorker:
                                     rotation[2],  # roll, pitch, yaw
                                 ]
 
-                        # No face detected while tracking enabled - set face lost timestamp
-                        elif self.last_face_detected_time is None or self.last_face_detected_time == current_time:
-                            # Only update if we haven't already set a face lost time
-                            # (current_time check prevents overriding the disable-triggered timestamp)
-                            pass
+                        # else: no face detected — last_face_detected_time already
+                        # holds the last detection timestamp; interpolation logic
+                        # below handles the fade-to-neutral after face_lost_delay.
 
                     # Handle smooth interpolation (works for both face-lost and tracking-disabled cases)
                     if self.last_face_detected_time is not None:
