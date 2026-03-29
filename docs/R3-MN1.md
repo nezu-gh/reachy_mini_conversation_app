@@ -73,7 +73,7 @@ All AI inference runs as Docker containers on a local VM, exposing OpenAI-compat
 | **LLM** | `192.168.178.155:3443/v1` | Qwen3.5-35B-A3B-IQ4_XS | ik-llama.cpp with `--jinja` |
 | **ASR/STT** | `192.168.178.155:8015/v1` | Qwen/Qwen3-ASR-0.6B | vLLM (qwen-asr-serve) |
 | **TTS** | `192.168.178.155:7034/v1` | qwen3-tts | Qwen3-TTS-Openai-Fastapi |
-| **Reachy Mini** | `192.168.178.127` | — | Robot daemon |
+| **Reachy Mini** | `192.168.178.127` | — | Robot daemon (v1.6.0) |
 | **Home Assistant** | `192.168.178.77:8123` | — | HA instance (future integration) |
 
 ---
@@ -496,20 +496,20 @@ libcamerasrc → capsfilter → tee ─→ queue → unixfdsink (camera socket)
 
 On this RPi 5, `v4l2h264enc` (hardware H264 encoder) fails with "not enough memory or failing driver". This stalls the `tee`, blocking **both** branches — the camera socket gets caps but zero buffers, and WebRTC video never streams.
 
-**Fix:** Replace `v4l2h264enc` with `videoconvert` → `openh264enc` (software encoder). Apply with:
+**Fix:** The patch adds runtime detection — it probes `v4l2h264enc` at startup and falls back to `openh264enc` (software encoder) if the hardware encoder is broken. Apply with:
 
 ```bash
 ssh pollen@192.168.178.127 'bash -s' < scripts/patch-daemon-camera.sh
 ```
 
-Then kill the daemon process (API restart is not sufficient — `GstWebRTC` is created once at init):
+Then kill the daemon process (API restart is not sufficient — the GStreamer pipeline is created once at init):
 
 ```bash
 ssh pollen@192.168.178.127 'kill $(pgrep -f "reachy_mini.daemon.app.main")'
 # systemd auto-restarts it
 ```
 
-The patch file is at `scripts/patch-daemon-camera.sh`. The daemon file patched is `/venvs/mini_daemon/lib/python3.12/site-packages/reachy_mini/media/webrtc_daemon.py`.
+The patch script (`scripts/patch-daemon-camera.sh`) supports both v1.5.x (`webrtc_daemon.py`) and v1.6.x (`media_server.py`). **Must be re-applied after any `pip install reachy-mini` upgrade.**
 
 ### TODOs
 
