@@ -141,6 +141,9 @@ def setup_logger(debug: bool) -> logging.Logger:
             fh.setLevel(getattr(logging, log_level, logging.INFO))
             fh.setFormatter(logging.Formatter(fmt))
             app_logger.addHandler(fh)
+            # Ensure this logger processes records (don't rely solely on root level)
+            app_logger.setLevel(getattr(logging, log_level, logging.INFO))
+            app_logger.info("File logging initialized: /tmp/r3mn1.log")
     except Exception:
         pass  # best-effort — don't crash if /tmp is unwritable
 
