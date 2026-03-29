@@ -68,10 +68,13 @@ class Camera(Tool):
         # handle images directly (e.g., Qwen3.5 with vision support).
         _multimodal_patterns = ("vlm", "vl-", "vision", "llava", "smolvlm", "qwen3.5")
         model_name = os.environ.get("MODEL_NAME", "").lower()
-        is_multimodal = (
-            os.environ.get("LLM_MULTIMODAL", "").lower() in ("1", "true", "yes")
-            or any(p in model_name for p in _multimodal_patterns)
-        )
+        _multimodal_env = os.environ.get("LLM_MULTIMODAL", "").lower()
+        if _multimodal_env in ("0", "false", "no"):
+            is_multimodal = False
+        elif _multimodal_env in ("1", "true", "yes"):
+            is_multimodal = True
+        else:
+            is_multimodal = any(p in model_name for p in _multimodal_patterns)
 
         if is_multimodal:
             # Encode frame as base64 JPEG for the multimodal LLM

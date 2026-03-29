@@ -66,6 +66,25 @@ async def test_camera_tool_multimodal_env_override() -> None:
 
 
 @pytest.mark.asyncio
+async def test_camera_tool_multimodal_env_disable() -> None:
+    """LLM_MULTIMODAL=0 should disable multimodal even for Qwen3.5."""
+    camera_worker = MagicMock()
+    camera_worker.get_latest_frame.return_value = np.full((32, 32, 3), [0, 0, 255], dtype=np.uint8)
+
+    deps = ToolDependencies(
+        reachy_mini=MagicMock(),
+        movement_manager=MagicMock(),
+        camera_worker=camera_worker,
+    )
+
+    with patch.dict("os.environ", {"MODEL_NAME": "Qwen3.5-35B", "LLM_MULTIMODAL": "0"}):
+        result = await Camera()(deps, question="What do you see?")
+
+    assert "error" in result
+    assert "vision" in result["error"].lower()
+
+
+@pytest.mark.asyncio
 async def test_camera_tool_uses_local_vision_processor_when_available() -> None:
     """The camera tool should use on-demand local vision when configured."""
     camera_worker = MagicMock()
