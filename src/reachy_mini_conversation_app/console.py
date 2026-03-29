@@ -309,6 +309,16 @@ class LocalStream:
         except Exception:
             pass
 
+        # Mount WebRTC voice chat routes (/webrtc)
+        try:
+            from reachy_mini_conversation_app.transports.webrtc_transport import (
+                mount_webrtc_routes,
+            )
+
+            mount_webrtc_routes(self._settings_app, self.handler)
+        except Exception:
+            pass
+
         self._settings_initialized = True
 
     def launch(self) -> None:

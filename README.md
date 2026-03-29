@@ -16,7 +16,9 @@ tags:
 
 Conversational app for the Reachy Mini robot combining real-time AI pipelines, vision, and choreographed motion libraries.
 
-This fork adds a **local pipeline provider** (pipecat-ai) that runs speech-to-text, LLM, and text-to-speech on self-hosted OpenAI-compatible endpoints — no cloud API keys required. It also includes ASR noise filtering, context management, service health probes, procedural micro-expression sounds, Direction of Arrival speaker tracking, and a systemd service for unattended operation on Raspberry Pi.
+This fork adds a **local pipeline provider** (pipecat-ai) that runs speech-to-text, LLM, and text-to-speech on self-hosted OpenAI-compatible endpoints — no cloud API keys required. It also includes ASR noise filtering, context management, service health probes, procedural micro-expression sounds, Direction of Arrival speaker tracking, conversation memory (OpenMemory/Mem0), intent-based LLM routing, pipeline observability with metrics, parallel memory+vision enrichment, proactive idle engagement, browser-based WebRTC voice chat, and a systemd service for unattended operation on Raspberry Pi.
+
+See [docs/R3-MN1.md](docs/R3-MN1.md) for the full technical documentation of the local pipeline and all augmentation phases.
 
 ![Reachy Mini Dance](docs/assets/reachy_mini_dance.gif)
 
@@ -138,6 +140,11 @@ Some wheels (like PyTorch) are large and require compatible CUDA or CPU builds�
 | `ASR_BASE_URL` | STT endpoint (default `http://{LOCAL_VM_IP}:8015/v1`). |
 | `LLM_BASE_URL` | LLM endpoint (default `http://{LOCAL_VM_IP}:3443/v1`). |
 | `TTS_BASE_URL` | TTS endpoint (default `http://{LOCAL_VM_IP}:7034/v1`). |
+| `MEM0_BASE_URL` | OpenMemory (Mem0) REST API for conversation memory (default `http://{LOCAL_VM_IP}:8765`). |
+| `LLM_FAST_BASE_URL` | Optional fast LLM endpoint for casual intents (intent-based routing). |
+| `LLM_FAST_MODEL` | Optional fast LLM model name. |
+| `MIN_INTERRUPT_WORDS` | Minimum words to trigger speech interruption (default `3`). |
+| `WEBRTC_MAX_CLIENTS` | Max concurrent WebRTC voice sessions (default `2`). |
 | `ENABLE_DOA_TRACKING` | Set to `1` to enable Direction of Arrival speaker tracking (requires ReSpeaker mic array). |
 
 ## Running the app
@@ -151,7 +158,7 @@ reachy-mini-conversation-app
 > [!TIP]
 > Make sure the Reachy Mini daemon is running before launching the app. If you see a `TimeoutError`, it means the daemon isn't started. See [Reachy Mini's SDK](https://github.com/pollen-robotics/reachy_mini/) for setup instructions.
 
-The app runs in console mode by default. Add `--gradio` to launch a web UI at http://127.0.0.1:7860/ (required for simulation mode). Vision and head-tracking options are described in the CLI table below.
+The app runs in console mode by default. Add `--gradio` to launch a web UI at http://127.0.0.1:7860/ (required for simulation mode). A WebRTC voice chat UI is also available at http://127.0.0.1:7860/webrtc (no Gradio required). Vision and head-tracking options are described in the CLI table below.
 
 ### CLI options
 

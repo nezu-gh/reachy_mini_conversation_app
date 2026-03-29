@@ -12,6 +12,14 @@ The upstream OpenAI Realtime API path is preserved as the default/fallback provi
 - [Infrastructure](#infrastructure)
 - [Provider System](#provider-system)
 - [Pipecat Pipeline](#pipecat-pipeline)
+- [Pipeline Augmentations](#pipeline-augmentations)
+  - [Observability & Metrics](#observability--metrics)
+  - [Audio Quality](#audio-quality)
+  - [Conversation Memory](#conversation-memory)
+  - [Proactive Engagement](#proactive-engagement)
+  - [LLM Router](#llm-router)
+  - [Parallel Enrichment](#parallel-enrichment)
+  - [WebRTC Voice Chat](#webrtc-voice-chat)
 - [Micro-Expressions](#micro-expressions)
 - [MCP Servers](#mcp-servers)
 - [Profile System](#profile-system)
@@ -52,9 +60,12 @@ The upstream OpenAI Realtime API path is preserved as the default/fallback provi
               │                                  │
               │  VAD → STT → ASRCleaner →        │
               │  UserAgg(+SmartTurn) →            │
-              │  VisionInjector → LLM →           │
+              │  ContextTrimmer →                 │
+              │  ParallelEnricher(mem+vision) →   │
+              │  IntentRouter → LLM →             │
               │  TextTap → TTSChunker →           │
-              │  TTS → Sink → AssistantAgg       │
+              │  TTS → Sink → AssistantAgg →     │
+              │  AutoMemoryTap                    │
               └────────┬────────┬────────┬───────┘
                        │        │        │
               ┌────────┴─┐ ┌───┴───┐ ┌──┴──────┐
@@ -156,7 +167,9 @@ The pipeline is built inside `PipecatProvider.start_up()` and runs as a backgrou
 ### Pipeline Order
 
 ```
-VAD → STT → ASRCleaner → UserAgg(+SmartTurn) → VisionInjector → LLM → TextTap → TTSChunker → TTS → Sink → AssistantAgg
+VAD → STT → ASRCleaner → UserAgg(+SmartTurn) → ContextTrimmer
+  → ParallelEnricher(memory+vision) → IntentRouter → LLM
+  → TextTap → TTSChunker → TTS → Sink → AssistantAgg → AutoMemoryTap
 ```
 
 | Processor | Class | Purpose |
@@ -164,14 +177,17 @@ VAD → STT → ASRCleaner → UserAgg(+SmartTurn) → VisionInjector → LLM �
 | **VAD** | `VADProcessor` | Silero VAD at 16 kHz; emits `VADUserStarted/StoppedSpeakingFrame` |
 | **STT** | `OpenAISTTService` | Qwen3-ASR via OpenAI-compatible API; buffers audio, commits on VAD stop |
 | **ASRTextCleaner** | Custom `FrameProcessor` | Strips `<asr_text>` prefix from Qwen ASR transcriptions |
-| **UserAgg** | `LLMUserAggregator` | Accumulates user turns; uses pipecat's built-in Smart Turn v3.2 (ONNX) for turn-completion detection |
-| **VisionInjector** | Custom `FrameProcessor` | Per-turn camera injection — intercepts `LLMContextFrame` and attaches camera frame. Two modes: multimodal (base64 JPEG for VLMs) or text-only (scene description via VisionProcessor for text LLMs like Qwen3.5) |
+| **UserAgg** | `LLMUserAggregator` | Accumulates user turns; uses pipecat's built-in Smart Turn v3.2 (ONNX) and `MinWordsUserTurnStartStrategy` (min 3 words to trigger interruption) |
+| **ContextTrimmer** | Custom `FrameProcessor` | Trims old messages to prevent OOM; keeps system messages, drops oldest user/assistant turns |
+| **ParallelEnricher** | Custom `FrameProcessor` | Runs memory search + vision capture concurrently via `asyncio.gather()`. Injects Mem0 memories as system message and camera frame (base64 JPEG or scene description) into user message. 5s memory cache TTL. |
+| **IntentRouter** | Custom `FrameProcessor` | Classifies user text into `casual`/`command`/`reasoning`/`creative` intents. Routes casual intents to optional fast LLM model. Logs routing decisions. |
 | **LLM** | `OpenAILLMService` | Qwen3.5-35B via ik-llama.cpp; thinking disabled via `chat_template_kwargs` |
 | **TextTap** | Custom `FrameProcessor` | Captures assistant text for Gradio chatbot display |
-| **TTSChunker** | Custom `FrameProcessor` | Waterfall text splitting (sentence→clause→phrase→word, max 150 chars) for faster time-to-first-audio |
+| **TTSChunker** | Custom `FrameProcessor` | Waterfall text splitting (sentence→clause→phrase→word, max 80 chars) for faster time-to-first-audio |
 | **TTS** | `OpenAITTSService` | Qwen3-TTS; always outputs 24 kHz |
 | **Sink** | Custom `FrameProcessor` | Bridges TTS audio → fastrtc output queue; feeds HeadWobbler |
 | **AssistantAgg** | `LLMAssistantAggregator` | Accumulates assistant turns into LLM context |
+| **AutoMemoryTap** | Custom `FrameProcessor` | Fire-and-forget store of conversation turns to Mem0 with `infer=True` for automatic fact extraction. Rate-limited to 1 store per 10s. |
 
 ### Audio Flow
 
@@ -216,6 +232,332 @@ Intercepts multiple frame types at the end of the pipeline:
 | `InterimTranscriptionFrame` | Push partial transcript to output queue |
 | `VADUserStartedSpeakingFrame` | Set listening=True, drain output queue (barge-in) |
 | `VADUserStoppedSpeakingFrame` | Keep listening=True (stay attentive between utterances) |
+
+---
+
+## Pipeline Augmentations
+
+Eight augmentation phases layered on top of the base pipeline, each independently deployable and tested.
+
+### Observability & Metrics
+
+**Module:** `_PipelineMetricsObserver` (inner class in `pipecat_provider.py`)
+
+Consumes pipecat's built-in metrics system (`enable_metrics=True`, `enable_usage_metrics=True`) via the observer pattern.
+
+**How it works:**
+- Registered as a `PipelineTask` observer — receives callbacks on `on_push_frame()` and `on_pipeline_started()`
+- Intercepts `MetricsFrame` containing `TTFBMetricsData`, `ProcessingMetricsData`, `LLMUsageMetricsData`, and `TTSUsageMetricsData`
+- Tracks TTFB per service (STT, LLM, TTS) with rolling 20-sample averages
+- Stores processing times, token usage, TTS character counts, and pipeline lifecycle events
+
+**API Endpoints:**
+- `GET /api/metrics` — detailed metrics (TTFB, averages, processing times, token usage, events)
+- `GET /api/health` — health endpoint enriched with pipeline metrics
+
+**Metrics storage structure:**
+```python
+self._metrics = {
+    "ttfb": {},          # Latest TTFB per service
+    "ttfb_avg": {},      # Rolling averages
+    "processing": {},    # Processing times per service
+    "token_usage": {},   # LLM prompt/completion tokens
+    "tts_chars": 0,      # Total TTS characters
+    "pipeline_events": [], # Lifecycle events with timestamps
+}
+```
+
+---
+
+### Audio Quality
+
+Two improvements to reduce false triggers and prevent backchannel interruptions.
+
+#### Noise Suppression
+
+**Library:** `noisereduce>=3.0.0` (optional dependency)
+
+Applied in `PipelineSource.run()` before audio enters the VAD:
+
+```python
+audio_f = audio.astype(np.float32) / 32767.0
+audio_f = nr.reduce_noise(y=audio_f, sr=sr, stationary=True, prop_decrease=0.75)
+audio = np.clip(audio_f * 32767, -32768, 32767).astype(np.int16)
+```
+
+- Uses stationary noise reduction (assumes consistent background noise)
+- `prop_decrease=0.75` preserves speech while reducing ambient noise
+- Graceful fallback: if `noisereduce` is not installed, audio passes through unchanged
+- Applied per-frame before `InputAudioRawFrame` is queued
+
+#### Smart Interruption Strategy
+
+**Class:** `MinWordsUserTurnStartStrategy` (pipecat built-in)
+
+Prevents single-word backchannel responses ("yeah", "uh-huh", "ok") from interrupting the robot mid-sentence.
+
+```python
+user_params = LLMUserAggregatorParams(
+    user_turn_strategies=UserTurnStrategies(
+        start=[MinWordsUserTurnStartStrategy(min_words=_min_interrupt_words)],
+    ),
+)
+```
+
+- Default: 3 words minimum to trigger interruption (configurable via `MIN_INTERRUPT_WORDS` env var)
+- Applied via `LLMContextAggregatorPair` which wraps the user/assistant aggregators
+- Works alongside existing `allow_interruptions=True` — interruptions still work, just need more words
+
+---
+
+### Conversation Memory
+
+**Backend:** OpenMemory (Mem0) running on the local VM at `192.168.178.155:8765`
+
+The robot remembers facts across conversations. "Remember I like jazz" → next session: robot references jazz. Facts are automatically extracted by Mem0's inference engine.
+
+#### Architecture
+
+```
+User says something    ParallelEnricher           AutoMemoryTap
+       │                     │                         │
+       │              ┌──────┴──────┐                  │
+       │              │ search_memories()              │
+       │              │ → GET /api/v1/memories/        │
+       │              │ → inject as system msg         │
+       │              └─────────────┘                  │
+       │                                               │
+       │              ┌────────────────────────────────┘
+       │              │ After each turn:
+       │              │ add_memory(text, infer=True)
+       │              │ → POST /api/v1/memories/
+       │              │ Rate limited: 1 store per 10s
+       │              └────────────────────────────────
+```
+
+#### Mem0 Client
+
+**File:** `src/reachy_mini_conversation_app/memory/mem0_client.py`
+
+Async HTTP client wrapping the OpenMemory REST API using `aiohttp`:
+
+| Method | HTTP | Endpoint | Purpose |
+|--------|------|----------|---------|
+| `add_memory(text)` | POST | `/api/v1/memories/` | Store fact with `infer=True` |
+| `search_memories(query, limit)` | GET | `/api/v1/memories/?search_query=...` | Semantic search |
+| `list_memories()` | GET | `/api/v1/memories/?user_id=...` | List all |
+| `delete_memory(memory_id)` | DELETE | `/api/v1/memories/` | Remove specific memory |
+
+**Env vars:** `MEM0_BASE_URL`, `MEM0_USER_ID` (default: `default`), `MEM0_APP_NAME` (default: `r3mn1`)
+
+#### Memory Tools
+
+Two LLM-callable tools registered in `profiles/r3_mn1/tools.txt`:
+
+| Tool | File | Purpose |
+|------|------|---------|
+| `store_memory` | `tools/store_memory.py` | Explicitly store a fact the user asks the robot to remember |
+| `recall_memory` | `tools/recall_memory.py` | Explicitly search memories by query |
+
+These complement the automatic memory system (ParallelEnricher + AutoMemoryTap) — the LLM can also proactively store/recall via tool calls.
+
+#### Memory Injection (in ParallelEnricher)
+
+- Runs concurrently with vision on each `LLMContextFrame`
+- Searches Mem0 with the last user message as query
+- Injects matching memories as a system message: `[memories about user: likes jazz, name is Alex]`
+- 5-second cache TTL to avoid redundant API calls
+
+#### Auto Memory Tap
+
+- Monitors assistant text output after `AssistantAgg`
+- Periodically sends conversation text to Mem0 with `infer=True`
+- Mem0 auto-extracts facts — no manual heuristics needed
+- Rate-limited: max 1 store per 10 seconds
+
+#### Web UI
+
+Browse and manage stored memories at `http://192.168.178.155:3001` (OpenMemory dashboard).
+
+---
+
+### Proactive Engagement
+
+**Method:** `PipecatProvider.send_idle_signal(idle_duration)`
+
+The robot initiates interaction when idle — subtle at first, more engaging over time.
+
+#### Tiered Idle Behavior
+
+| Duration | Behavior | Implementation |
+|----------|----------|----------------|
+| 15–45s | Subtle reaction | Micro-expression or small head movement |
+| 45s+ | Comment on scene | Describe what it sees, suggest a dance, ask a question |
+| 120s+ | Reduced frequency | One prompt every 60s to avoid being annoying |
+
+**How it works:**
+1. The idle timer (in `main.py`) calls `send_idle_signal(idle_duration_seconds)`
+2. The method builds a context-aware prompt: `"[system: idle for Ns. Scene: {description}. Do something.]"`
+3. Injects a `TranscriptionFrame` into the pipeline, triggering the LLM to respond
+4. The LLM uses its tools (micro_expression, play_emotion, dance, camera) based on the prompt instructions
+
+#### Vision-Triggered Greetings
+
+When the VisionInjector detects a scene change (e.g., person appears), the idle signal includes the scene description. The profile instructions tell the LLM to greet newcomers naturally.
+
+**Profile section** (`profiles/r3_mn1/instructions.txt`):
+```
+## IDLE BEHAVIOR
+When you receive a [system: idle for ...] message, you are being nudged to
+do something because nobody has spoken for a while. ...
+```
+
+---
+
+### LLM Router
+
+**Files:** `src/reachy_mini_conversation_app/llm/intent_classifier.py`, `llm_router.py`
+
+Routes simple messages to a fast/small LLM and complex messages to the full model. Falls back to the default model if no fast model is configured.
+
+#### Intent Classifier
+
+Pattern-based classifier (no ML overhead) with 4 categories:
+
+| Intent | Examples | Confidence |
+|--------|----------|------------|
+| `CASUAL` | "hi", "thanks", "ok", "how are you?" | 0.7–0.9 |
+| `COMMAND` | "dance for me", "take a photo", "move head left" | 0.7–0.9 |
+| `REASONING` | "explain quantum computing", "why is the sky blue?" | 0.6–0.8 |
+| `CREATIVE` | "tell me a joke", "write a poem about robots" | 0.8 |
+
+**Classification logic:**
+1. Check casual patterns (exact match on short messages) → CASUAL
+2. Short messages (≤3 words): check command → creative → reasoning → CASUAL fallback
+3. Longer messages: command hits → COMMAND; creative patterns → CREATIVE; reasoning patterns → REASONING
+4. Long messages (>10 words) with no pattern match → REASONING
+5. Medium-length, no signal → CASUAL
+
+#### LLM Router
+
+```python
+class LLMRouter:
+    def route(self, intent: Intent) -> LLMConfig:
+        if self.fast and intent == Intent.CASUAL:
+            return self.fast  # fast model for greetings/acknowledgments
+        return self.default   # full model for everything else
+```
+
+**Env vars:** `LLM_FAST_BASE_URL`, `LLM_FAST_MODEL` (both optional — if not set, all intents use the default model)
+
+#### IntentRouter FrameProcessor
+
+Sits in the pipeline between ParallelEnricher and LLM. On each `LLMContextFrame`:
+1. Extracts last user message text
+2. Runs `classify()` to get intent + confidence
+3. Logs the routing decision: `IntentRouter: 'hello' → casual (90%) → small-model`
+
+---
+
+### Parallel Enrichment
+
+**Class:** `ParallelEnricher` (inner class in `pipecat_provider.py`)
+
+Replaces the sequential `MemoryInjector → VisionInjector` pair with a single processor that runs both operations concurrently via `asyncio.gather()`.
+
+#### Why Not ParallelPipeline?
+
+Pipecat's `ParallelPipeline` sends the same frame to multiple branches, but both memory and vision modify the same `LLMContextFrame` (memory adds a system message, vision modifies the user message). `ParallelPipeline`'s frame deduplication would drop one modification. The `asyncio.gather()` approach runs both fetch operations concurrently, then applies results sequentially to the frame — safe and correct.
+
+#### Execution Flow
+
+```
+LLMContextFrame arrives
+    │
+    ├── asyncio.gather()
+    │   ├── _fetch_memories(user_text) → search Mem0 API (network I/O)
+    │   └── _fetch_vision(frame)       → camera capture + encode (CPU)
+    │
+    ├── Apply memory result → insert system message at index 1
+    ├── Apply vision result → modify last user message (image or description)
+    │
+    └── push enriched frame downstream
+```
+
+**Latency saving:** ~latency-of-slower-operation per turn. If memory takes 50ms and vision takes 100ms, the sequential approach took 150ms; parallel takes ~100ms.
+
+#### TTS Streaming Optimization
+
+`TTSTextChunker.max_chars` reduced from 150 → 80 for faster time-to-first-audio:
+- 80 chars ≈ 13 words ≈ one short sentence
+- TTS starts producing audio sooner since it doesn't wait for longer text chunks
+- Sentence boundary awareness preserved (waterfall split: sentence → clause → phrase → word)
+
+---
+
+### WebRTC Voice Chat
+
+**File:** `src/reachy_mini_conversation_app/transports/webrtc_transport.py`
+
+Browser-based voice conversation via WebRTC — talk to the robot from any phone or laptop without Gradio.
+
+#### Architecture
+
+```
+Browser                               Server (port 7860)
+┌─────────────────┐                  ┌──────────────────────────────┐
+│ getUserMedia()  │                  │ GET /webrtc → HTML UI        │
+│   ↓             │                  │                              │
+│ RTCPeerConnection ── POST ──────→  │ POST /webrtc/offer           │
+│   ↓ SDP offer   │   /webrtc/offer │   → SmallWebRTCRequestHandler│
+│                  │ ← SDP answer ── │   → SmallWebRTCConnection    │
+│   ↓             │                  │   → SmallWebRTCTransport     │
+│ Audio track  ←→ │ ← WebRTC ────→  │   → Pipeline(VAD→STT→LLM→   │
+│ (mic+speaker)   │                  │              TTS→transport)  │
+│                  │                  │                              │
+│ PATCH ──────────────────────────→  │ PATCH /webrtc/offer          │
+│ (ICE candidates)│                  │   → trickle ICE              │
+└─────────────────┘                  └──────────────────────────────┘
+```
+
+#### Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/webrtc` | Serve the voice chat web UI |
+| POST | `/webrtc/offer` | Handle WebRTC SDP offer, create pipeline |
+| PATCH | `/webrtc/offer` | Handle ICE candidate trickle |
+| GET | `/webrtc/sessions` | Return active/max session counts |
+
+#### Web UI
+
+Custom HTML/JS page at `static/webrtc.html`:
+- One-button connect/disconnect
+- Visual status ring (idle → connecting → connected)
+- Live session count display
+- Microphone permission request via `getUserMedia()`
+- Remote audio playback via `ontrack` handler
+- STUN server: `stun:stun.l.google.com:19302`
+
+#### Session Management
+
+- Max concurrent sessions: 2 (configurable via `WEBRTC_MAX_CLIENTS`)
+- Each WebRTC connection gets its own pipeline (VAD → STT → LLM → TTS)
+- Pipelines share the same service endpoints (STT, LLM, TTS URLs) but create independent service instances
+- Sessions are tracked in `_active_sessions` dict with async lock
+- Automatic cleanup when connection drops or pipeline ends
+- Returns HTTP 429 when session limit is reached
+
+#### Env Vars
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `WEBRTC_MAX_CLIENTS` | `2` | Max concurrent WebRTC sessions |
+| `WEBRTC_ICE_SERVERS` | `stun:stun.l.google.com:19302` | Comma-separated STUN/TURN URLs |
+
+#### Usage
+
+Navigate to `http://<robot-ip>:7860/webrtc` in any modern browser. Click "Connect", grant microphone access, and start talking.
 
 ---
 
@@ -328,8 +670,8 @@ await manager.stop()    # cancels all tasks
 
 | File | Purpose |
 |------|---------|
-| `instructions.txt` | Robot identity, personality, hardware awareness |
-| `tools.txt` | Enabled tools: dance, stop_dance, play_emotion, stop_emotion, move_head, camera, do_nothing |
+| `instructions.txt` | Robot identity, personality, hardware awareness, conversational rhythm, emotional awareness, memory instructions, idle behavior |
+| `tools.txt` | Enabled tools: dance, stop_dance, play_emotion, stop_emotion, move_head, camera, do_nothing, store_memory, recall_memory |
 | `r3_mn1.env.example` | Minimal env template pointing to `.env.r3mn1` |
 
 **Key personality traits:**
@@ -368,20 +710,31 @@ cp .env.r3mn1 .env   # or: ln -s .env.r3mn1 .env
 | `TTS_BASE_URL` | `http://{VM}:7034/v1` | TTS endpoint |
 | `TTS_MODEL` | `qwen3-tts` | TTS model ID |
 | `LOCAL_VISION_MODEL` | `HuggingFaceTB/SmolVLM2-2.2B-Instruct` | Vision model for MCP server |
+| `MEM0_BASE_URL` | `http://192.168.178.155:8765` | OpenMemory (Mem0) REST API endpoint |
+| `MEM0_USER_ID` | `default` | User ID for memory storage/retrieval |
+| `MEM0_APP_NAME` | `r3mn1` | App name registered with OpenMemory |
+| `LLM_FAST_BASE_URL` | — | Optional fast LLM endpoint for casual intents |
+| `LLM_FAST_MODEL` | — | Optional fast LLM model name |
+| `MIN_INTERRUPT_WORDS` | `3` | Minimum words to trigger speech interruption |
+| `WEBRTC_MAX_CLIENTS` | `2` | Max concurrent WebRTC voice sessions |
+| `WEBRTC_ICE_SERVERS` | `stun:stun.l.google.com:19302` | STUN/TURN servers for WebRTC |
 | `HA_URL` | `http://192.168.178.77:8123` | Home Assistant URL |
 | `HA_TOKEN` | — | HA long-lived access token |
 
 ### pyproject.toml
 
-New optional dependency group:
+Optional dependency group for the local pipeline:
 
 ```toml
 [project.optional-dependencies]
 local_pipeline = [
     "pipecat-ai[silero,whisper,ollama,kokoro]>=0.0.49",
     "fastmcp>=2.0.0",
+    "noisereduce>=3.0.0",
 ]
 ```
+
+`noisereduce` is optional — if not installed, the noise filter gracefully skips.
 
 ---
 
@@ -540,16 +893,25 @@ All changes from the initial upstream fork to the current state:
 ### What Works Now
 
 - Full STT→LLM→TTS pipeline (Qwen-ASR + Qwen3.5-35B + Qwen3-TTS) tested end-to-end
-- 10 robot tools registered: dance, stop_dance, play_emotion, stop_emotion, move_head, camera, do_nothing, micro_expression, task_cancel, task_status
+- 12 robot tools registered: dance, stop_dance, play_emotion, stop_emotion, move_head, camera, do_nothing, micro_expression, task_cancel, task_status, store_memory, recall_memory
 - Robot connected at 192.168.178.127 (movements, emotions, head control)
 - Gradio UI at http://0.0.0.0:7860 for browser-based audio interaction
+- WebRTC voice chat at http://0.0.0.0:7860/webrtc (no Gradio needed, up to 2 concurrent sessions)
 - LLM TTFB: 0.3s (thinking disabled via chat_template_kwargs)
 - Barge-in support (allow_interruptions + output queue drain), VAD-driven listening mode, head wobble from TTS audio
-- Per-turn vision injection (VisionInjector: multimodal image for VLMs, text description for text-only LLMs)
-- TTS text chunking (waterfall split at sentence/clause/phrase/word boundaries, max 150 chars)
+- Smart interruption: MinWordsUserTurnStartStrategy prevents single-word backchannel from interrupting (min 3 words)
+- Noise suppression via noisereduce (stationary, prop_decrease=0.75) before VAD
+- Parallel memory + vision enrichment via asyncio.gather() before each LLM turn
+- Conversation memory via OpenMemory (Mem0) — auto-extract facts, semantic search, inject as context
+- Intent-based LLM routing (casual/command/reasoning/creative) with optional fast model for casual intents
+- Per-turn vision injection (multimodal image for VLMs, text description for text-only LLMs)
+- TTS text chunking (waterfall split, max 80 chars for faster TTFB)
 - Smart Turn v3.2 turn-completion detection (pipecat built-in ONNX model)
 - Non-verbal micro-expressions (8 procedural sounds) for quick emotional reactions, bypassing TTS
 - Camera capture via unixfdsrc socket (1280×720 YUY2 from daemon) and subprocess fallback
+- Pipeline observability: TTFB tracking, rolling averages, token usage, pipeline events via /api/metrics
+- Proactive idle engagement: tiered idle signals (subtle → medium → reduced frequency)
+- Prompt-based conversational rhythm and emotional awareness instructions
 
 ### Camera Fix (v4l2h264enc → openh264enc)
 
@@ -584,10 +946,24 @@ The patch script (`scripts/patch-daemon-camera.sh`) supports both v1.5.x (`webrt
 | **MCP Integration** | Wire `MCPManager.start()` into `main.py` alongside `MovementManager` | Medium |
 | **Home Assistant** | Add HA token, wire state events from robot_server to HA | Medium |
 | **Vision MCP** | Wire SmolVLM2 into vision_server MCP tool, connect camera | Medium |
-| **Memory** | Replace JSON store with SQLite/vector DB | Low |
 | **TTS Voices** | Query TTS endpoint for available voices in `get_available_voices()` | Low |
 | **Profile hot-reload** | Implement `apply_personality()` to rebuild LLMContext without pipeline restart | Low |
-| **Idle behavior** | Inject idle nudge messages into LLM context for tool invocation | Low |
+| **WebRTC transcript** | Wire pipecat data channel to send live transcripts to web UI | Low |
+| **LLM Router** | Actually switch LLM service settings when fast model is configured (currently logs only) | Low |
+| **Memory dedup** | Add deduplication to AutoMemoryTap to avoid storing near-identical facts | Low |
+
+### Completed (from Companion Roadmap)
+
+| Area | What | Phase |
+|------|------|-------|
+| **Prompt enrichment** | Conversational rhythm, emotional awareness, memory, idle behavior instructions | Phase 0 |
+| **Observability** | MetricsObserver, TTFB tracking, /api/metrics endpoint | Phase 1 |
+| **Audio quality** | Noise suppression (noisereduce), MinWordsUserTurnStartStrategy | Phase 2 |
+| **Memory** | Mem0 client, store/recall tools, MemoryInjector, AutoMemoryTap | Phase 3 |
+| **Proactive engagement** | Tiered idle signals, vision-triggered greetings | Phase 4 |
+| **LLM Router** | Intent classifier, model routing, IntentRouter processor | Phase 5 |
+| **Parallel pipeline** | ParallelEnricher (asyncio.gather), TTS chunk size optimization | Phase 6 |
+| **Web interface** | SmallWebRTCTransport, /webrtc UI, session management | Phase 7 |
 
 ### Files NOT Modified
 

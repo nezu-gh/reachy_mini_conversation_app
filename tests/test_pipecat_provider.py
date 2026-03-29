@@ -194,3 +194,43 @@ def test_pipeline_health_returns_metrics() -> None:
     assert "barge_in_generation" in health
     assert health["frames_dropped"] == 0
     assert health["barge_in_active"] is False
+    # Phase 1: metrics fields present
+    assert "ttfb" in health
+    assert "ttfb_avg" in health
+    assert "processing" in health
+    assert "token_usage" in health
+    assert "tts_chars" in health
+
+
+def test_detailed_metrics_includes_events() -> None:
+    """get_detailed_metrics() includes pipeline_events."""
+    provider = _make_provider()
+    detailed = provider.get_detailed_metrics()
+    assert "pipeline_events" in detailed
+    assert isinstance(detailed["pipeline_events"], list)
+
+
+@pytest.mark.asyncio
+async def test_metrics_observer_collects_ttfb() -> None:
+    """_PipelineMetricsObserver records TTFB data from MetricsFrame."""
+    from reachy_mini_conversation_app.providers.pipecat_provider import (
+        _PipelineMetricsObserver,
+    )
+
+    provider = _make_provider()
+    observer = _PipelineMetricsObserver(provider)
+
+    # Simulate a MetricsFrame push
+    try:
+        from pipecat.frames.frames import MetricsFrame
+        from pipecat.metrics.metrics import TTFBMetricsData
+
+        mock_data = MagicMock()
+        frame = MetricsFrame(data=[TTFBMetricsData(processor="stt", value=0.42)])
+        mock_data.frame = frame
+        await observer.on_push_frame(mock_data)
+
+        assert provider._metrics["ttfb"]["stt"] == 0.42
+        assert provider._metrics["ttfb_avg"]["stt"] == 0.42
+    except ImportError:
+        pytest.skip("pipecat not installed")

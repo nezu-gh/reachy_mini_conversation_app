@@ -212,6 +212,79 @@ def _warm_up_tts() -> None:
         logger.warning("TTS warm-up failed (non-fatal): %s", exc)
 
 
+class _PipelineMetricsObserver:
+    """Observer that collects TTFB, processing, and usage metrics from pipecat.
+
+    Attached to PipelineTask to intercept MetricsFrame data and pipeline
+    lifecycle events.  Stores results in the provider's _metrics dict.
+    """
+
+    def __init__(self, provider: "PipecatProvider") -> None:
+        self._provider = provider
+
+    async def on_push_frame(self, data: Any) -> None:
+        """Called for every frame pushed between processors."""
+        frame = getattr(data, "frame", None)
+        if frame is None:
+            return
+
+        # Only process MetricsFrame
+        try:
+            from pipecat.frames.frames import MetricsFrame
+        except ImportError:
+            return
+
+        if not isinstance(frame, MetricsFrame):
+            return
+
+        from pipecat.metrics.metrics import (
+            TTFBMetricsData,
+            ProcessingMetricsData,
+            LLMUsageMetricsData,
+            TTSUsageMetricsData,
+        )
+
+        metrics = self._provider._metrics
+        for item in frame.data:
+            proc = getattr(item, "processor", "unknown")
+            if isinstance(item, TTFBMetricsData):
+                metrics["ttfb"][proc] = round(item.value, 3)
+                hist = self._provider._ttfb_history.setdefault(proc, [])
+                hist.append(item.value)
+                if len(hist) > 10:
+                    hist.pop(0)
+                metrics["ttfb_avg"][proc] = round(sum(hist) / len(hist), 3)
+                logger.debug("TTFB %s: %.3fs (avg %.3fs)", proc, item.value, metrics["ttfb_avg"][proc])
+            elif isinstance(item, ProcessingMetricsData):
+                metrics["processing"][proc] = round(item.value, 3)
+            elif isinstance(item, LLMUsageMetricsData):
+                model = getattr(item, "model", "unknown") or "unknown"
+                usage = item.value
+                metrics["token_usage"][model] = {
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens,
+                }
+            elif isinstance(item, TTSUsageMetricsData):
+                metrics["tts_chars"] += item.value
+
+    async def on_pipeline_started(self) -> None:
+        """Called when pipeline has fully started."""
+        logger.info("Pipeline observer: pipeline started")
+        self._add_event("started")
+
+    async def on_process_frame(self, data: Any) -> None:
+        """Passthrough — we only care about pushed frames."""
+        pass
+
+    def _add_event(self, event_type: str) -> None:
+        import time as _time
+        events = self._provider._metrics["pipeline_events"]
+        events.append({"type": event_type, "ts": _time.time()})
+        if len(events) > 20:
+            events.pop(0)
+
+
 class PipecatProvider(ConversationProvider):
     """Fully-local conversation backend powered by pipecat-ai.
 
@@ -263,6 +336,17 @@ class PipecatProvider(ConversationProvider):
         self._last_stt_time: float = 0.0
         self._last_llm_time: float = 0.0
         self._last_tts_time: float = 0.0
+
+        # Pipeline metrics (populated by observer)
+        self._metrics: dict = {
+            "ttfb": {},          # processor → latest TTFB in seconds
+            "ttfb_avg": {},      # processor → rolling average TTFB
+            "processing": {},    # processor → latest processing time
+            "token_usage": {},   # model → {prompt, completion, total}
+            "tts_chars": 0,      # total TTS characters processed
+            "pipeline_events": [],  # last N pipeline events
+        }
+        self._ttfb_history: dict[str, list[float]] = {}  # processor → last 10 values
 
     # ------------------------------------------------------------------
     # ConversationProvider abstract methods
@@ -544,15 +628,41 @@ class PipecatProvider(ConversationProvider):
 
         context = LLMContext(tools=openai_tools)
 
-        # No vad_analyzer in user_params — the standalone VADProcessor
-        # already broadcasts VAD frames into the pipeline.
-        user_agg, assistant_agg = LLMContextAggregatorPair(context)
+        # MinWords turn start strategy: require N words to interrupt the bot.
+        # Single-word backchannel ("yeah", "uh-huh") won't interrupt.
+        from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
+            MinWordsUserTurnStartStrategy,
+        )
+        from pipecat.turns.user_turn_strategies import UserTurnStrategies
+        from pipecat.processors.aggregators.llm_response_universal import (
+            LLMUserAggregatorParams,
+        )
+
+        _min_interrupt_words = int(os.environ.get("MIN_INTERRUPT_WORDS", "3"))
+        user_params = LLMUserAggregatorParams(
+            user_turn_strategies=UserTurnStrategies(
+                start=[MinWordsUserTurnStartStrategy(min_words=_min_interrupt_words)],
+            ),
+        )
+        user_agg, assistant_agg = LLMContextAggregatorPair(
+            context, user_params=user_params,
+        )
+        logger.info("MinWords interruption: %d words to interrupt bot", _min_interrupt_words)
 
         # ---- Bridge processors -------------------------------------------
         # PipelineSource: pulls from _audio_in_queue, emits InputAudioRawFrame
         # PipelineSink: catches TTS audio + transcripts, pushes to output_queue
 
         provider_ref = self  # avoid closure over self in nested classes
+
+        # Noise reduction (optional — degrades gracefully if noisereduce not installed)
+        try:
+            import noisereduce as nr
+            _nr_available = True
+            logger.info("Noise reduction: noisereduce available, will filter mic audio")
+        except ImportError:
+            _nr_available = False
+            logger.info("Noise reduction: noisereduce not installed, skipping (pip install noisereduce)")
 
         class PipelineSource(FrameProcessor):
             """Pulls audio from the fastrtc inbound queue into the pipeline."""
@@ -580,6 +690,16 @@ class PipecatProvider(ConversationProvider):
                             audio = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
                         else:
                             audio = audio.astype(np.int16)
+
+                    # Apply noise reduction before VAD/STT
+                    if _nr_available and audio.size > 0:
+                        try:
+                            audio_f = audio.astype(np.float32) / 32767.0
+                            audio_f = nr.reduce_noise(y=audio_f, sr=sr, stationary=True, prop_decrease=0.75)
+                            audio = np.clip(audio_f * 32767, -32768, 32767).astype(np.int16)
+                        except Exception:
+                            pass  # non-fatal — use unfiltered audio
+
                     audio_bytes = audio.tobytes()
                     frame = InputAudioRawFrame(
                         audio=audio_bytes,
@@ -1025,13 +1145,355 @@ class PipecatProvider(ConversationProvider):
                 # (like assistant_aggregator) still see the frame.
                 await self.push_frame(frame, direction)
 
+        class MemoryInjector(FrameProcessor):
+            """Inject relevant memories into LLM context before each turn.
+
+            Queries Mem0 with the last user message and prepends matching
+            memories as a system-message prefix so the LLM can reference them.
+            Results are cached for 5s to avoid redundant API calls.
+            """
+
+            def __init__(self) -> None:
+                super().__init__()
+                self._cache: list[dict] = []
+                self._cache_time: float = 0.0
+                self._cache_ttl: float = 5.0
+
+            async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                await super().process_frame(frame, direction)
+                if not isinstance(frame, LLMContextFrame):
+                    await self.push_frame(frame, direction)
+                    return
+
+                # Extract last user message for search query
+                messages = frame.context.get_messages()
+                query = ""
+                for msg in reversed(messages):
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            query = content
+                        elif isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    query = part.get("text", "")
+                                    break
+                        break
+
+                if query:
+                    memories = await self._get_memories(query)
+                    if memories:
+                        mem_text = ", ".join(m.get("content", "") for m in memories if m.get("content"))
+                        if mem_text:
+                            # Inject as first system message after the main system prompt
+                            messages = frame.context.get_messages()
+                            insert_idx = 1 if messages and messages[0].get("role") == "system" else 0
+                            mem_msg = {"role": "system", "content": f"[memories about user: {mem_text}]"}
+                            messages.insert(insert_idx, mem_msg)
+                            frame.context.set_messages(messages)
+                            logger.debug("MemoryInjector: injected %d memories", len(memories))
+
+                await self.push_frame(frame, direction)
+
+            async def _get_memories(self, query: str) -> list[dict]:
+                """Search memories with caching."""
+                import time as _time
+
+                now = _time.monotonic()
+                if now - self._cache_time < self._cache_ttl and self._cache:
+                    return self._cache
+
+                try:
+                    from reachy_mini_conversation_app.memory.mem0_client import Mem0Client
+
+                    client = Mem0Client()
+                    try:
+                        items = await client.search_memories(query, limit=5)
+                        self._cache = items
+                        self._cache_time = now
+                        return items
+                    finally:
+                        await client.close()
+                except Exception as exc:
+                    logger.debug("MemoryInjector: search failed: %s", exc)
+                    return []
+
+        class AutoMemoryTap(FrameProcessor):
+            """Auto-store conversation turns to Mem0 for fact extraction.
+
+            Monitors assistant text output and periodically sends the
+            conversation context to Mem0 with infer=True so it can
+            extract memorable facts automatically.
+            Rate-limited to 1 store per 10s.
+            """
+
+            def __init__(self) -> None:
+                super().__init__()
+                self._last_store_time: float = 0.0
+                self._store_interval: float = 10.0
+                self._pending_text: str = ""
+
+            async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                await super().process_frame(frame, direction)
+
+                # Collect user transcripts and assistant text
+                if isinstance(frame, TranscriptionFrame):
+                    text = getattr(frame, "text", "")
+                    if text:
+                        self._pending_text += f" User: {text}"
+                elif isinstance(frame, TTSTextFrame):
+                    text = getattr(frame, "text", "")
+                    if text:
+                        self._pending_text += f" Assistant: {text}"
+
+                # Rate-limited store
+                if self._pending_text:
+                    import time as _time
+
+                    now = _time.monotonic()
+                    if now - self._last_store_time > self._store_interval:
+                        text_to_store = self._pending_text.strip()
+                        self._pending_text = ""
+                        self._last_store_time = now
+                        # Fire-and-forget — don't block the pipeline
+                        asyncio.create_task(
+                            self._store(text_to_store),
+                            name="auto-memory-store",
+                        )
+
+                await self.push_frame(frame, direction)
+
+            async def _store(self, text: str) -> None:
+                try:
+                    from reachy_mini_conversation_app.memory.mem0_client import Mem0Client
+
+                    client = Mem0Client()
+                    try:
+                        await client.add_memory(text)
+                    finally:
+                        await client.close()
+                except Exception as exc:
+                    logger.debug("AutoMemoryTap: store failed: %s", exc)
+
+        class ParallelEnricher(FrameProcessor):
+            """Run memory and vision enrichment concurrently.
+
+            Replaces sequential MemoryInjector → VisionInjector with a
+            single processor that runs both via asyncio.gather(), saving
+            ~latency-of-slower-operation per turn.
+            """
+
+            MAX_DIM = 512
+            JPEG_QUALITY = 60
+
+            def __init__(self, *, multimodal: bool = False) -> None:
+                super().__init__()
+                self._multimodal = multimodal
+                # Memory cache
+                self._mem_cache: list[dict] = []
+                self._mem_cache_time: float = 0.0
+                self._mem_cache_ttl: float = 5.0
+
+            async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                await super().process_frame(frame, direction)
+                if not isinstance(frame, LLMContextFrame):
+                    await self.push_frame(frame, direction)
+                    return
+
+                # Extract last user message (shared by both operations)
+                messages = frame.context.get_messages()
+                user_text = ""
+                for msg in reversed(messages):
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            user_text = content
+                        elif isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    user_text = part.get("text", "")
+                                    break
+                        break
+
+                # Run memory + vision concurrently
+                mem_result, vision_result = await asyncio.gather(
+                    self._fetch_memories(user_text),
+                    self._fetch_vision(frame),
+                    return_exceptions=True,
+                )
+
+                # Apply memory enrichment (adds system message)
+                if isinstance(mem_result, str) and mem_result:
+                    messages = frame.context.get_messages()
+                    insert_idx = 1 if messages and messages[0].get("role") == "system" else 0
+                    messages.insert(insert_idx, {
+                        "role": "system",
+                        "content": f"[memories about user: {mem_result}]",
+                    })
+                    frame.context.set_messages(messages)
+                    logger.debug("ParallelEnricher: injected memories")
+                elif isinstance(mem_result, Exception):
+                    logger.debug("ParallelEnricher: memory fetch failed: %s", mem_result)
+
+                # Apply vision enrichment (modifies last user message)
+                if isinstance(vision_result, Exception):
+                    logger.debug("ParallelEnricher: vision fetch failed: %s", vision_result)
+                elif vision_result is not None:
+                    mode, data = vision_result
+                    messages = frame.context.get_messages()
+                    for msg in reversed(messages):
+                        if msg.get("role") == "user":
+                            if mode == "image":
+                                content = msg.get("content", "")
+                                if isinstance(content, str):
+                                    msg["content"] = [
+                                        {"type": "text", "text": content},
+                                        {"type": "image_url", "image_url": {"url": data}},
+                                    ]
+                                elif isinstance(content, list):
+                                    content.append(
+                                        {"type": "image_url", "image_url": {"url": data}}
+                                    )
+                            elif mode == "description":
+                                text = msg.get("content", "")
+                                if isinstance(text, str):
+                                    msg["content"] = f"[scene: {data}]\n{text}"
+                            break
+                    logger.debug("ParallelEnricher: injected vision (%s)", mode)
+
+                await self.push_frame(frame, direction)
+
+            async def _fetch_memories(self, query: str) -> str:
+                """Search Mem0 with caching. Returns formatted string or empty."""
+                if not query:
+                    return ""
+                import time as _time
+
+                now = _time.monotonic()
+                if now - self._mem_cache_time < self._mem_cache_ttl and self._mem_cache:
+                    items = self._mem_cache
+                else:
+                    try:
+                        from reachy_mini_conversation_app.memory.mem0_client import Mem0Client
+
+                        client = Mem0Client()
+                        try:
+                            items = await client.search_memories(query, limit=5)
+                            self._mem_cache = items
+                            self._mem_cache_time = now
+                        finally:
+                            await client.close()
+                    except Exception as exc:
+                        logger.debug("ParallelEnricher: memory search failed: %s", exc)
+                        return ""
+
+                return ", ".join(m.get("content", "") for m in items if m.get("content"))
+
+            async def _fetch_vision(self, frame: Any) -> tuple[str, str] | None:
+                """Capture camera frame and encode/describe. Returns (mode, data) or None."""
+                cam = provider_ref.deps.camera_worker
+                if cam is None:
+                    return None
+
+                raw_frame = cam.get_latest_frame()
+                if raw_frame is None:
+                    return None
+
+                if self._multimodal:
+                    b64_url = await asyncio.to_thread(self._encode_frame, raw_frame)
+                    return ("image", b64_url) if b64_url else None
+                elif provider_ref.deps.vision_processor is not None:
+                    try:
+                        desc = await asyncio.to_thread(
+                            provider_ref.deps.vision_processor.process_image,
+                            raw_frame,
+                            "Briefly describe the scene and any people visible.",
+                        )
+                        if desc and desc != "Vision model not initialized":
+                            return ("description", desc)
+                    except Exception as e:
+                        logger.warning("ParallelEnricher: VLM failed: %s", e)
+                return None
+
+            @staticmethod
+            def _encode_frame(frame: Any) -> str | None:
+                """Resize + JPEG-encode a BGR numpy frame → data URL."""
+                import cv2
+
+                try:
+                    h, w = frame.shape[:2]
+                    if max(h, w) > ParallelEnricher.MAX_DIM:
+                        scale = ParallelEnricher.MAX_DIM / max(h, w)
+                        frame = cv2.resize(
+                            frame,
+                            (int(w * scale), int(h * scale)),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    ok, buf = cv2.imencode(
+                        ".jpg",
+                        frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, ParallelEnricher.JPEG_QUALITY],
+                    )
+                    if not ok:
+                        return None
+                    b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+                    return f"data:image/jpeg;base64,{b64}"
+                except Exception as e:
+                    logger.warning("ParallelEnricher: encode failed: %s", e)
+                    return None
+
+        class IntentRouter(FrameProcessor):
+            """Route LLM requests to fast or full model based on intent.
+
+            Classifies the last user message and logs the routing decision.
+            When a fast LLM is configured, adjusts the LLM service settings
+            for casual intents (shorter max_tokens, potentially different model).
+            """
+
+            def __init__(self, llm_service: Any) -> None:
+                super().__init__()
+                self._llm = llm_service
+                from reachy_mini_conversation_app.llm.llm_router import LLMRouter
+                self._router = LLMRouter(
+                    default_base_url=LLM_BASE_URL,
+                    default_model=LLM_MODEL,
+                )
+
+            async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                await super().process_frame(frame, direction)
+                if isinstance(frame, LLMContextFrame):
+                    # Classify the last user message
+                    messages = frame.context.get_messages()
+                    user_text = ""
+                    for msg in reversed(messages):
+                        if msg.get("role") == "user":
+                            content = msg.get("content", "")
+                            if isinstance(content, str):
+                                user_text = content
+                            break
+
+                    if user_text:
+                        from reachy_mini_conversation_app.llm.intent_classifier import classify
+                        result = classify(user_text)
+                        config = self._router.route(result.intent)
+
+                        # Log routing decision
+                        logger.debug(
+                            "IntentRouter: '%s' → %s (%.0f%%) → %s",
+                            user_text[:50], result.intent.value,
+                            result.confidence * 100, config.model[:30],
+                        )
+
+                await self.push_frame(frame, direction)
+
         # ---- Assemble pipeline -------------------------------------------
         # PipelineTask._process_push_queue() sends StartFrame automatically
         # with audio_in/out sample rates from PipelineParams.
         #
         # Pipeline order:
         #   VAD → STT → ASRCleaner → user_agg(+smart-turn) → ContextTrimmer
-        #     → VisionInjector → LLM → text_tap → TTSChunker → TTS → sink → assistant_agg
+        #     → ParallelEnricher(memory+vision) → IntentRouter → LLM → text_tap
+        #     → TTSChunker → TTS → sink → assistant_agg → AutoMemoryTap
         #
         # PipelineSource runs as a separate asyncio task and injects
         # InputAudioRawFrame via task.queue_frame().
@@ -1063,9 +1525,12 @@ class PipecatProvider(ConversationProvider):
             logger.info("VisionInjector: disabled (text-only LLM, no VisionProcessor)")
 
         context_trimmer = ContextTrimmer()
-        tts_chunker = TTSTextChunker(max_chars=150)
+        parallel_enricher = ParallelEnricher(multimodal=_is_multimodal)
+        intent_router = IntentRouter(llm)
+        tts_chunker = TTSTextChunker(max_chars=80)
         text_tap = AssistantTextTap()
         sink = PipelineSink()
+        auto_memory = AutoMemoryTap()
 
         logger.info(
             "SmartTurn: using pipecat built-in LocalSmartTurnAnalyzerV3 "
@@ -1074,20 +1539,25 @@ class PipecatProvider(ConversationProvider):
 
         pipeline = Pipeline(
             [
-                vad,              # analyse audio for speech boundaries
-                stt,              # transcribe speech segments
-                asr_cleaner,      # strip <asr_text> prefix + noise filter
-                user_agg,         # accumulate user turns + smart-turn detection
-                context_trimmer,  # trim old messages to prevent OOM
-                vision_injector,  # attach camera frame to every LLM context
-                llm,              # generate response
+                vad,               # analyse audio for speech boundaries
+                stt,               # transcribe speech segments
+                asr_cleaner,       # strip <asr_text> prefix + noise filter
+                user_agg,          # accumulate user turns + smart-turn detection
+                context_trimmer,   # trim old messages to prevent OOM
+                parallel_enricher, # memory + vision concurrently via gather()
+                intent_router,     # classify intent + log routing decision
+                llm,               # generate response
                 text_tap,         # capture assistant text before TTS
                 tts_chunker,      # split long text into TTS-friendly chunks
                 tts,              # synthesise speech
                 sink,             # bridge audio + transcripts → fastrtc
                 assistant_agg,    # accumulate assistant turns
+                auto_memory,      # auto-store conversation facts to Mem0
             ]
         )
+
+        # Create metrics observer
+        metrics_observer = _PipelineMetricsObserver(self)
 
         task = PipelineTask(
             pipeline,
@@ -1098,6 +1568,7 @@ class PipecatProvider(ConversationProvider):
                 enable_metrics=True,
                 enable_usage_metrics=True,
             ),
+            observers=[metrics_observer],
         )
         self._pipeline_task = task
         self._source = source
@@ -1118,13 +1589,21 @@ class PipecatProvider(ConversationProvider):
             """
             _source = PipelineSource()
             _asr_cleaner = ASRTextCleaner()
-            _vision_injector = VisionInjector(multimodal=_is_multimodal)
+            _parallel_enricher = ParallelEnricher(multimodal=_is_multimodal)
             _context_trimmer = ContextTrimmer()
-            _tts_chunker = TTSTextChunker(max_chars=150)
+            _tts_chunker = TTSTextChunker(max_chars=80)
             _text_tap = AssistantTextTap()
             _sink = PipelineSink()
+            _auto_memory = AutoMemoryTap()
             _context = LLMContext(tools=openai_tools)
-            _user_agg, _assistant_agg = LLMContextAggregatorPair(_context)
+            _user_params = LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    start=[MinWordsUserTurnStartStrategy(min_words=_min_interrupt_words)],
+                ),
+            )
+            _user_agg, _assistant_agg = LLMContextAggregatorPair(
+                _context, user_params=_user_params,
+            )
 
             # Rebuild services to avoid reusing corrupted state
             _stt = OpenAISTTService(
@@ -1155,10 +1634,12 @@ class PipecatProvider(ConversationProvider):
                 vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE),
             )
 
+            _intent_router = IntentRouter(_llm)
             _pipeline = Pipeline([
                 _vad, _stt, _asr_cleaner, _user_agg, _context_trimmer,
-                _vision_injector, _llm, _text_tap, _tts_chunker, _tts,
-                _sink, _assistant_agg,
+                _parallel_enricher, _intent_router, _llm,
+                _text_tap, _tts_chunker, _tts, _sink, _assistant_agg,
+                _auto_memory,
             ])
             _task = PipelineTask(
                 _pipeline,
@@ -1169,6 +1650,7 @@ class PipecatProvider(ConversationProvider):
                     enable_metrics=True,
                     enable_usage_metrics=True,
                 ),
+                observers=[metrics_observer],
             )
             return _source, _task
 
@@ -1275,7 +1757,18 @@ class PipecatProvider(ConversationProvider):
             "barge_in_active": self._barge_in_active,
             "barge_in_generation": self._barge_in_generation,
             "pipeline_alive": self._pipeline_task is not None,
+            "ttfb": self._metrics.get("ttfb", {}),
+            "ttfb_avg": self._metrics.get("ttfb_avg", {}),
+            "processing": self._metrics.get("processing", {}),
+            "token_usage": self._metrics.get("token_usage", {}),
+            "tts_chars": self._metrics.get("tts_chars", 0),
         }
+
+    def get_detailed_metrics(self) -> dict:
+        """Return full metrics including pipeline events (for /api/metrics)."""
+        health = self.get_pipeline_health()
+        health["pipeline_events"] = self._metrics.get("pipeline_events", [])
+        return health
 
     # ------------------------------------------------------------------
     # Idle behaviour
@@ -1284,8 +1777,62 @@ class PipecatProvider(ConversationProvider):
     async def send_idle_signal(self, idle_duration: float) -> None:
         """Send an idle nudge to the LLM so the robot does something.
 
-        Not yet implemented: would inject a user-turn message into the
-        LLMContext and queue an LLMRunFrame so the model can invoke a
-        tool (dance, emotion, etc.).  Currently a no-op — requires the
-        tool registry to be wired into the pipeline first.
+        Injects a synthetic system message into the pipeline so the LLM
+        can initiate interaction (dance, comment on scene, greet, etc.).
+
+        Tiered behaviour:
+          15-45s  → subtle (micro_expression, small head movement)
+          45-120s → medium (comment on scene, dance)
+          >120s   → reduce frequency (cooldown in emit() handles this)
         """
+        if self._pipeline_task is None:
+            return
+
+        # Get scene description if vision is available
+        scene = ""
+        cam = self.deps.camera_worker
+        if cam is not None:
+            raw = cam.get_latest_frame()
+            if raw is not None and self.deps.vision_processor is not None:
+                try:
+                    desc = await asyncio.to_thread(
+                        self.deps.vision_processor.process_image,
+                        raw,
+                        "Briefly describe the scene and any people visible.",
+                    )
+                    if desc and desc != "Vision model not initialized":
+                        scene = f" You can see: {desc}."
+                except Exception:
+                    pass
+
+        # Tiered prompts
+        if idle_duration < 45:
+            prompt = (
+                f"[system: You've been idle for {int(idle_duration)}s.{scene} "
+                "Do something subtle — a micro_expression, a small head movement, "
+                "or just vibe. Keep it natural, don't speak unless you have "
+                "something to say.]"
+            )
+        else:
+            prompt = (
+                f"[system: You've been idle for {int(idle_duration)}s.{scene} "
+                "Do something — dance, comment on what you see, move around, "
+                "or start a conversation. Don't be awkward about it.]"
+            )
+
+        try:
+            from pipecat.frames.frames import (
+                InputAudioRawFrame,
+                TranscriptionFrame,
+            )
+
+            # Inject as a transcription frame (triggers the LLM pipeline)
+            frame = TranscriptionFrame(
+                text=prompt,
+                user_id="system",
+                timestamp="",
+            )
+            await self._pipeline_task.queue_frame(frame)
+            logger.info("Idle signal sent (%.0fs idle)", idle_duration)
+        except Exception as exc:
+            logger.warning("Failed to send idle signal: %s", exc)

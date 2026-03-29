@@ -6,4 +6,6 @@ move_head
 camera
 do_nothing
 micro_expression
+store_memory
+recall_memory
 # head_tracking is commented out — CPU-intensive on local hardware

@@ -114,6 +114,16 @@ def mount_dashboard_routes(
             "pipeline": pipeline_health,
         })
 
+    # --- GET /api/metrics ---
+    @app.get("/api/metrics")
+    def metrics() -> JSONResponse:
+        if hasattr(handler, "get_detailed_metrics") and callable(handler.get_detailed_metrics):
+            try:
+                return JSONResponse(handler.get_detailed_metrics())
+            except Exception:
+                pass
+        return JSONResponse({"error": "metrics not available"}, status_code=503)
+
     # --- GET /api/config ---
     @app.get("/api/config")
     def get_config() -> JSONResponse:

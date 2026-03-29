@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reachy Mini - Voice Chat</title>
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --surface: #16213e;
+    --primary: #0f3460;
+    --accent: #e94560;
+    --text: #eee;
+    --muted: #888;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+  .container {
+    max-width: 480px;
+    width: 100%;
+    padding: 2rem;
+    text-align: center;
+  }
+  h1 {
+    font-size: 1.5rem;
+    margin-bottom: 0.5rem;
+    letter-spacing: 0.02em;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin-bottom: 2rem;
+  }
+  .status-ring {
+    width: 160px;
+    height: 160px;
+    border-radius: 50%;
+    border: 4px solid var(--primary);
+    margin: 0 auto 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: border-color 0.3s, box-shadow 0.3s;
+    position: relative;
+  }
+  .status-ring.connected {
+    border-color: #4caf50;
+    box-shadow: 0 0 30px rgba(76, 175, 80, 0.3);
+  }
+  .status-ring.connecting {
+    border-color: #ff9800;
+    animation: pulse 1.5s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 10px rgba(255, 152, 0, 0.2); }
+    50% { box-shadow: 0 0 30px rgba(255, 152, 0, 0.5); }
+  }
+  .status-icon {
+    font-size: 3rem;
+  }
+  .status-text {
+    font-size: 0.85rem;
+    color: var(--muted);
+    margin-bottom: 1.5rem;
+  }
+  .btn {
+    display: inline-block;
+    padding: 0.8rem 2.5rem;
+    border: none;
+    border-radius: 2rem;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.1s, opacity 0.2s;
+  }
+  .btn:active { transform: scale(0.97); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-connect {
+    background: var(--accent);
+    color: #fff;
+  }
+  .btn-disconnect {
+    background: #555;
+    color: #fff;
+  }
+  .transcript {
+    margin-top: 2rem;
+    background: var(--surface);
+    border-radius: 1rem;
+    padding: 1rem;
+    max-height: 200px;
+    overflow-y: auto;
+    text-align: left;
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+  .transcript:empty { display: none; }
+  .transcript .user { color: #64b5f6; }
+  .transcript .bot { color: #81c784; }
+  .health {
+    margin-top: 1rem;
+    font-size: 0.75rem;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Reachy Mini</h1>
+  <p class="subtitle">Voice Chat via WebRTC</p>
+
+  <div class="status-ring" id="statusRing">
+    <span class="status-icon" id="statusIcon">&#x1F50A;</span>
+  </div>
+  <p class="status-text" id="statusText">Ready to connect</p>
+
+  <button class="btn btn-connect" id="connectBtn" onclick="toggleConnection()">
+    Connect
+  </button>
+
+  <div class="transcript" id="transcript"></div>
+  <div class="health" id="health"></div>
+</div>
+
+<script>
+let pc = null;
+let pcId = null;
+let connected = false;
+
+const ring = document.getElementById('statusRing');
+const icon = document.getElementById('statusIcon');
+const text = document.getElementById('statusText');
+const btn = document.getElementById('connectBtn');
+
+function setStatus(state, msg) {
+  ring.className = 'status-ring ' + state;
+  text.textContent = msg;
+  if (state === 'connected') {
+    icon.innerHTML = '&#x1F3A4;';
+    btn.textContent = 'Disconnect';
+    btn.className = 'btn btn-disconnect';
+  } else if (state === 'connecting') {
+    icon.innerHTML = '&#x23F3;';
+    btn.disabled = true;
+  } else {
+    icon.innerHTML = '&#x1F50A;';
+    btn.textContent = 'Connect';
+    btn.className = 'btn btn-connect';
+    btn.disabled = false;
+  }
+  connected = state === 'connected';
+}
+
+async function toggleConnection() {
+  if (connected) {
+    disconnect();
+  } else {
+    await connect();
+  }
+}
+
+async function connect() {
+  setStatus('connecting', 'Connecting...');
+
+  try {
+    pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    // Audio track from microphone
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+    // Data channel for messages
+    const dc = pc.createDataChannel('chat');
+    dc.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'transcript') {
+          addTranscript(msg.role || 'bot', msg.text);
+        }
+      } catch {}
+    };
+
+    // Remote audio
+    pc.ontrack = (e) => {
+      const audio = new Audio();
+      audio.srcObject = e.streams[0];
+      audio.play().catch(() => {});
+    };
+
+    // Create offer
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // Wait for ICE gathering
+    await new Promise((resolve) => {
+      if (pc.iceGatheringState === 'complete') return resolve();
+      const check = () => {
+        if (pc.iceGatheringState === 'complete') {
+          pc.removeEventListener('icegatheringstatechange', check);
+          resolve();
+        }
+      };
+      pc.addEventListener('icegatheringstatechange', check);
+      // Timeout after 5s
+      setTimeout(resolve, 5000);
+    });
+
+    // Send offer to server
+    const resp = await fetch('/webrtc/offer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sdp: pc.localDescription.sdp,
+        type: pc.localDescription.type,
+      }),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.error || 'Connection failed');
+    }
+
+    const answer = await resp.json();
+    pcId = answer.pc_id;
+    await pc.setRemoteDescription(new RTCSessionDescription({
+      sdp: answer.sdp,
+      type: answer.type,
+    }));
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        setStatus('connected', 'Listening...');
+      } else if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
+        disconnect();
+      }
+    };
+
+    // If already connected (fast path)
+    if (pc.connectionState === 'connected') {
+      setStatus('connected', 'Listening...');
+    }
+
+  } catch (e) {
+    console.error('Connect error:', e);
+    setStatus('', 'Error: ' + e.message);
+    disconnect();
+  }
+}
+
+function disconnect() {
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+  pcId = null;
+  setStatus('', 'Disconnected');
+}
+
+function addTranscript(role, text) {
+  const el = document.getElementById('transcript');
+  const span = document.createElement('div');
+  span.className = role;
+  span.textContent = (role === 'user' ? 'You: ' : 'Reachy: ') + text;
+  el.appendChild(span);
+  el.scrollTop = el.scrollHeight;
+}
+
+// Periodically check session count
+setInterval(async () => {
+  try {
+    const r = await fetch('/webrtc/sessions');
+    const d = await r.json();
+    document.getElementById('health').textContent =
+      `Sessions: ${d.active}/${d.max}`;
+  } catch {}
+}, 5000);
+</script>
+</body>
+</html>

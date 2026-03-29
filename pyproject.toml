@@ -34,6 +34,7 @@ dependencies = [
 local_pipeline = [
     "pipecat-ai[silero,whisper,ollama,kokoro]>=0.0.49",
     "fastmcp>=2.0.0",
+    "noisereduce>=3.0.0",
 ]
 local_vision = [
   "accelerate>=1.13.0",
