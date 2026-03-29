@@ -504,12 +504,15 @@ class LocalStream:
         logger.info("Audio recording started at %d Hz", input_sample_rate)
 
         _consecutive_errors = 0
+        _consecutive_timeouts = 0
         _frame_count = 0
         while not self._stop_event.is_set():
             try:
-                audio_frame = await asyncio.to_thread(
-                    self._robot.media.get_audio_sample,
+                audio_frame = await asyncio.wait_for(
+                    asyncio.to_thread(self._robot.media.get_audio_sample),
+                    timeout=2.0,
                 )
+                _consecutive_timeouts = 0
                 if audio_frame is not None:
                     _frame_count += 1
                     if _frame_count <= 3 or _frame_count % 500 == 0:
@@ -519,6 +522,23 @@ class LocalStream:
                         )
                     await self.handler.receive((input_sample_rate, audio_frame))
                 _consecutive_errors = 0
+            except asyncio.TimeoutError:
+                _consecutive_timeouts += 1
+                if _consecutive_timeouts <= 3 or _consecutive_timeouts % 30 == 0:
+                    logger.warning(
+                        "record_loop: get_audio_sample timed out (%d consecutive)",
+                        _consecutive_timeouts,
+                    )
+                if _consecutive_timeouts >= 15:
+                    # Audio source is stuck — try to restart recording
+                    logger.error("record_loop: audio source stuck, restarting recording")
+                    try:
+                        self._robot.media.stop_recording()
+                        await asyncio.sleep(0.5)
+                        self._robot.media.start_recording()
+                    except Exception:
+                        logger.exception("record_loop: failed to restart recording")
+                    _consecutive_timeouts = 0
             except asyncio.CancelledError:
                 raise
             except Exception:
