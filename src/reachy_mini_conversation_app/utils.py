@@ -128,15 +128,19 @@ def setup_logger(debug: bool) -> logging.Logger:
 
     # Add a rotating file handler so logs are always readable even when
     # the daemon captures stdout/stderr via a socket.
+    # Attach to our app logger (not root) so uvicorn's dictConfig can't remove it.
     try:
         from logging.handlers import RotatingFileHandler
 
-        fh = RotatingFileHandler(
-            "/tmp/r3mn1.log", maxBytes=2 * 1024 * 1024, backupCount=2,
-        )
-        fh.setLevel(getattr(logging, log_level, logging.INFO))
-        fh.setFormatter(logging.Formatter(fmt))
-        logging.getLogger().addHandler(fh)
+        app_logger = logging.getLogger("reachy_mini_conversation_app")
+        # Avoid duplicate handlers on repeated calls
+        if not any(isinstance(h, RotatingFileHandler) for h in app_logger.handlers):
+            fh = RotatingFileHandler(
+                "/tmp/r3mn1.log", maxBytes=2 * 1024 * 1024, backupCount=2,
+            )
+            fh.setLevel(getattr(logging, log_level, logging.INFO))
+            fh.setFormatter(logging.Formatter(fmt))
+            app_logger.addHandler(fh)
     except Exception:
         pass  # best-effort — don't crash if /tmp is unwritable
 
