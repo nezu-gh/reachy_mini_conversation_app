@@ -18,10 +18,8 @@ before it reaches the output queue.
 """
 
 from __future__ import annotations
-import io
 import os
 import re
-import wave
 import base64
 import asyncio
 import logging
@@ -63,11 +61,6 @@ TTS_MODEL = os.environ.get("TTS_MODEL", "qwen3-tts")
 
 ASR_BASE_URL = os.environ.get("ASR_BASE_URL", f"http://{_DEFAULT_VM}:8015/v1")
 ASR_MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
-
-# Optional smart-turn VAD endpoint (Flask server with ONNX turn-completion model).
-# When set, the pipeline holds VADUserStoppedSpeakingFrame until the model
-# confirms the user's turn is complete.  When unset, Silero VAD alone decides.
-SMART_TURN_URL = os.environ.get("SMART_TURN_URL", "")
 
 # ---------------------------------------------------------------------------
 # Audio constants
@@ -226,6 +219,7 @@ class PipecatProvider(ConversationProvider):
         from pipecat.processors.audio.vad_processor import VADProcessor
         from pipecat.processors.aggregators.llm_context import LLMContext
         from pipecat.processors.aggregators.llm_response_universal import (
+            LLMContextFrame,
             LLMContextAggregatorPair,
         )
 
@@ -403,98 +397,92 @@ class PipecatProvider(ConversationProvider):
                         frame.text = cleaned
                 await self.push_frame(frame, direction)
 
-        class SmartTurnGate(FrameProcessor):
-            """Hold VADUserStoppedSpeakingFrame until a smart-turn model
-            confirms the user's turn is complete.
+        class VisionInjector(FrameProcessor):
+            """Attach a camera frame to every LLM turn.
 
-            Buffers recent InputAudioRawFrame data.  When Silero VAD fires
-            a stop-speaking event, the accumulated audio is sent to an
-            external smart-turn endpoint.  If the model says "incomplete",
-            the stop-speaking frame is suppressed and the pipeline keeps
-            listening.  If "complete" (or no endpoint configured), the
-            frame passes through normally.
+            "Always capture, route later" pattern: on each
+            LLMContextFrame (the user aggregator pushing context to the
+            LLM), grab the latest camera frame, JPEG-encode it, and
+            inject it as a multimodal image in the last user message.
+            The LLM decides whether the image is relevant.
+
+            If no camera_worker is available or no frame is captured,
+            the context passes through unchanged.
             """
 
-            def __init__(self, endpoint: str, sample_rate: int = 16000) -> None:
-                super().__init__()
-                self._endpoint = endpoint.rstrip("/") if endpoint else ""
-                self._sample_rate = sample_rate
-                self._audio_chunks: list[bytes] = []
-                self._max_seconds = 8  # smart-turn model uses last 8s
+            MAX_DIM = 512       # resize longest edge
+            JPEG_QUALITY = 60   # balance quality vs payload size
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
-                # Buffer raw audio for the turn-completion check
-                if isinstance(frame, InputAudioRawFrame):
-                    self._audio_chunks.append(frame.audio)
-                    # Cap buffer at max_seconds worth of audio
-                    max_bytes = self._sample_rate * 2 * self._max_seconds  # 16-bit mono
-                    total = sum(len(c) for c in self._audio_chunks)
-                    while total > max_bytes and len(self._audio_chunks) > 1:
-                        total -= len(self._audio_chunks.pop(0))
+                if not isinstance(frame, LLMContextFrame):
                     await self.push_frame(frame, direction)
                     return
 
-                if isinstance(frame, VADUserStartedSpeakingFrame):
-                    self._audio_chunks.clear()
+                # Grab camera frame (non-blocking, already buffered)
+                cam = provider_ref.deps.camera_worker
+                if cam is None:
                     await self.push_frame(frame, direction)
                     return
 
-                if isinstance(frame, VADUserStoppedSpeakingFrame):
-                    if not self._endpoint or not self._audio_chunks:
-                        await self.push_frame(frame, direction)
-                        return
-
-                    # Check with smart-turn model
-                    is_complete = await self._check_turn_complete()
-                    if is_complete:
-                        logger.debug("SmartTurn: turn complete, forwarding stop-speaking")
-                        await self.push_frame(frame, direction)
-                    else:
-                        logger.info("SmartTurn: turn incomplete, suppressing stop-speaking")
-                        # Don't forward — pipeline keeps listening
+                raw_frame = cam.get_latest_frame()
+                if raw_frame is None:
+                    await self.push_frame(frame, direction)
                     return
 
+                # Encode in a thread to avoid blocking the event loop
+                b64_url = await asyncio.to_thread(
+                    self._encode_frame, raw_frame
+                )
+                if b64_url is None:
+                    await self.push_frame(frame, direction)
+                    return
+
+                # Inject image into the last user message
+                messages = frame.context.get_messages()
+                for msg in reversed(messages):
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            msg["content"] = [
+                                {"type": "text", "text": content},
+                                {"type": "image_url", "image_url": {"url": b64_url}},
+                            ]
+                        elif isinstance(content, list):
+                            # Already multimodal — append image
+                            content.append(
+                                {"type": "image_url", "image_url": {"url": b64_url}}
+                            )
+                        break
+
+                logger.debug("VisionInjector: attached camera frame to LLM context")
                 await self.push_frame(frame, direction)
 
-            async def _check_turn_complete(self) -> bool:
-                """Send buffered audio to the smart-turn endpoint."""
+            @staticmethod
+            def _encode_frame(frame: Any) -> str | None:
+                """Resize + JPEG-encode a BGR numpy frame → data URL."""
+                import cv2
+
                 try:
-                    import aiohttp
-
-                    pcm = b"".join(self._audio_chunks)
-
-                    # Encode as WAV for the endpoint
-                    buf = io.BytesIO()
-                    with wave.open(buf, "wb") as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(self._sample_rate)
-                        wf.writeframes(pcm)
-                    audio_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(
-                            f"{self._endpoint}/predict",
-                            json={"audio_base64": audio_b64},
-                            timeout=aiohttp.ClientTimeout(total=3.0),
-                        ) as resp:
-                            if resp.status == 200:
-                                result = await resp.json()
-                                prediction = result.get("prediction", 1)
-                                prob = result.get("probability", 1.0)
-                                logger.debug(
-                                    "SmartTurn: prediction=%d probability=%.2f",
-                                    prediction, prob,
-                                )
-                                return prediction == 1
-                            logger.warning("SmartTurn: HTTP %d", resp.status)
-                            return True
-                except ImportError:
-                    logger.warning("SmartTurn: aiohttp not installed, passing through")
-                    return True
+                    h, w = frame.shape[:2]
+                    if max(h, w) > VisionInjector.MAX_DIM:
+                        scale = VisionInjector.MAX_DIM / max(h, w)
+                        frame = cv2.resize(
+                            frame,
+                            (int(w * scale), int(h * scale)),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    ok, buf = cv2.imencode(
+                        ".jpg",
+                        frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, VisionInjector.JPEG_QUALITY],
+                    )
+                    if not ok:
+                        return None
+                    b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+                    return f"data:image/jpeg;base64,{b64}"
                 except Exception as e:
-                    logger.warning("SmartTurn: check failed (%s), passing through", e)
-                    return True
+                    logger.warning("VisionInjector: encode failed: %s", e)
+                    return None
 
         class TTSTextChunker(FrameProcessor):
             """Split long LLM text into TTS-friendly chunks for faster
@@ -641,18 +629,21 @@ class PipecatProvider(ConversationProvider):
                     provider_ref.deps.movement_manager.set_listening(True)
                     if provider_ref.deps.head_wobbler is not None:
                         provider_ref.deps.head_wobbler.reset()
-                    # Barge-in: drain pending audio so the robot stops
-                    # talking when the user interrupts.
+                    # Barge-in: drain ALL pending audio from the output
+                    # queue so the robot stops talking immediately.
+                    # Preserve transcript AdditionalOutputs (non-audio).
+                    kept: list = []
                     while not provider_ref.output_queue.empty():
                         try:
                             item = provider_ref.output_queue.get_nowait()
                             if isinstance(item, AdditionalOutputs):
-                                # Keep transcript outputs, discard audio
-                                await provider_ref.output_queue.put(item)
-                                break
+                                kept.append(item)
+                            # else: discard audio tuples
                         except asyncio.QueueEmpty:
                             break
-                    logger.debug("User speech started (barge-in)")
+                    for item in kept:
+                        await provider_ref.output_queue.put(item)
+                    logger.debug("User speech started (barge-in, drained audio)")
 
                 elif isinstance(frame, VADUserStoppedSpeakingFrame):
                     # Stay in listening mode — robot remains attentive
@@ -673,37 +664,37 @@ class PipecatProvider(ConversationProvider):
         # with audio_in/out sample rates from PipelineParams.
         #
         # Pipeline order:
-        #   VAD → SmartTurn → STT → ASRCleaner → user_agg → LLM
-        #     → text_tap → TTSChunker → TTS → sink → assistant_agg
+        #   VAD → STT → ASRCleaner → user_agg(+smart-turn) → VisionInjector
+        #     → LLM → text_tap → TTSChunker → TTS → sink → assistant_agg
         #
         # PipelineSource runs as a separate asyncio task and injects
         # InputAudioRawFrame via task.queue_frame().
 
         source = PipelineSource()
-        smart_turn = SmartTurnGate(SMART_TURN_URL, sample_rate=PIPELINE_SAMPLE_RATE)
         asr_cleaner = ASRTextCleaner()
+        vision_injector = VisionInjector()
         tts_chunker = TTSTextChunker(max_chars=150)
         text_tap = AssistantTextTap()
         sink = PipelineSink()
 
-        if SMART_TURN_URL:
-            logger.info("SmartTurn VAD enabled: %s", SMART_TURN_URL)
-        else:
-            logger.info("SmartTurn VAD disabled (set SMART_TURN_URL to enable)")
+        logger.info(
+            "SmartTurn: using pipecat built-in LocalSmartTurnAnalyzerV3 "
+            "(bundled ONNX model, runs on-device)"
+        )
 
         pipeline = Pipeline(
             [
-                vad,            # analyse audio for speech boundaries
-                smart_turn,     # hold stop-speaking until turn is confirmed complete
-                stt,            # transcribe speech segments
-                asr_cleaner,    # strip <asr_text> prefix from Qwen ASR
-                user_agg,       # accumulate user turns
-                llm,            # generate response
-                text_tap,       # capture assistant text before TTS
-                tts_chunker,    # split long text into TTS-friendly chunks
-                tts,            # synthesise speech
-                sink,           # bridge audio + transcripts → fastrtc
-                assistant_agg,  # accumulate assistant turns
+                vad,              # analyse audio for speech boundaries
+                stt,              # transcribe speech segments
+                asr_cleaner,      # strip <asr_text> prefix from Qwen ASR
+                user_agg,         # accumulate user turns + smart-turn detection
+                vision_injector,  # attach camera frame to every LLM context
+                llm,              # generate response
+                text_tap,         # capture assistant text before TTS
+                tts_chunker,      # split long text into TTS-friendly chunks
+                tts,              # synthesise speech
+                sink,             # bridge audio + transcripts → fastrtc
+                assistant_agg,    # accumulate assistant turns
             ]
         )
 
