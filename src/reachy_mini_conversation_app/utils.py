@@ -120,10 +120,26 @@ def initialize_camera_and_vision(
 def setup_logger(debug: bool) -> logging.Logger:
     """Setups the logger."""
     log_level = "DEBUG" if debug else "INFO"
+    fmt = "%(asctime)s %(levelname)s %(name)s:%(lineno)d | %(message)s"
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s:%(lineno)d | %(message)s",
+        format=fmt,
     )
+
+    # Add a rotating file handler so logs are always readable even when
+    # the daemon captures stdout/stderr via a socket.
+    try:
+        from logging.handlers import RotatingFileHandler
+
+        fh = RotatingFileHandler(
+            "/tmp/r3mn1.log", maxBytes=2 * 1024 * 1024, backupCount=2,
+        )
+        fh.setLevel(getattr(logging, log_level, logging.INFO))
+        fh.setFormatter(logging.Formatter(fmt))
+        logging.getLogger().addHandler(fh)
+    except Exception:
+        pass  # best-effort — don't crash if /tmp is unwritable
+
     logger = logging.getLogger(__name__)
 
     # Suppress WebRTC warnings

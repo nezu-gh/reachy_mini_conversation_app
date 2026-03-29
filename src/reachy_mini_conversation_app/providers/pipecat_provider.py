@@ -378,22 +378,12 @@ class PipecatProvider(ConversationProvider):
     # AsyncStreamHandler audio contract
     # ------------------------------------------------------------------
 
-    _receive_count = 0
-
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
         """Accept an audio frame from fastrtc or LocalStream and forward into the pipeline.
 
         Handles both int16 (fastrtc/Gradio) and float32 (LocalStream/robot mic)
         input formats.  Resamples to the pipeline's 16 kHz if needed.
         """
-        PipecatProvider._receive_count += 1
-        if PipecatProvider._receive_count <= 5 or PipecatProvider._receive_count % 50 == 0:
-            try:
-                with open("/tmp/diag.log", "a") as _df:
-                    _df.write(f"[DIAG] receive #{PipecatProvider._receive_count} pipeline_task={'SET' if self._pipeline_task else 'NONE'} queue_id={id(self._audio_in_queue)} qsize={self._audio_in_queue.qsize()}\n")
-                    _df.flush()
-            except Exception:
-                pass
         if self._pipeline_task is None:
             return
 
@@ -689,26 +679,11 @@ class PipecatProvider(ConversationProvider):
             async def run(self, task: PipelineTask) -> None:
                 """Background loop that feeds mic audio into the pipeline."""
                 _src_count = 0
-                _timeout_count = 0
                 logger.info("PipelineSource.run: started, waiting for audio frames")
-                try:
-                    with open("/tmp/diag.log", "a") as _df:
-                        _df.write(f"[DIAG] PipelineSource.run started, queue_id={id(provider_ref._audio_in_queue)}, qsize={provider_ref._audio_in_queue.qsize()}\n")
-                        _df.flush()
-                except Exception:
-                    pass
                 while self._running:
                     try:
                         sr, audio = await asyncio.wait_for(provider_ref._audio_in_queue.get(), timeout=0.5)
                     except asyncio.TimeoutError:
-                        _timeout_count += 1
-                        if _timeout_count <= 5 or _timeout_count % 100 == 0:
-                            try:
-                                with open("/tmp/diag.log", "a") as _df:
-                                    _df.write(f"[DIAG] PipelineSource timeout #{_timeout_count}, qsize={provider_ref._audio_in_queue.qsize()}, running={self._running}\n")
-                                    _df.flush()
-                            except Exception:
-                                pass
                         continue
 
                     # Audio is already int16 after receive() conversion
@@ -718,20 +693,12 @@ class PipecatProvider(ConversationProvider):
                         else:
                             audio = audio.astype(np.int16)
 
-                    # Apply noise reduction before VAD/STT
-                    # noisereduce needs ≥1024 samples (scipy welch nperseg);
-                    # real-time chunks are typically 320 samples (20ms @ 16kHz),
-                    # so skip noise reduction for now — it corrupts short frames.
-                    # TODO: accumulate a buffer of ≥1024 samples before filtering.
-
                     _src_count += 1
                     if _src_count <= 3 or _src_count % 500 == 0:
-                        try:
-                            with open("/tmp/diag.log", "a") as _df:
-                                _df.write(f"[DIAG] PipelineSource: frame #{_src_count} sr={sr} samples={len(audio)} max={int(np.abs(audio).max())}\n")
-                                _df.flush()
-                        except Exception:
-                            pass
+                        logger.info(
+                            "PipelineSource: frame #%d sr=%d samples=%d",
+                            _src_count, sr, len(audio),
+                        )
 
                     audio_bytes = audio.tobytes()
                     frame = InputAudioRawFrame(
@@ -1131,12 +1098,6 @@ class PipecatProvider(ConversationProvider):
                 # The robot should always be listening when idle — only
                 # TTS playback (above) temporarily clears the flag.
                 elif isinstance(frame, VADUserStartedSpeakingFrame):
-                    try:
-                        with open("/tmp/diag.log", "a") as _df:
-                            _df.write("[DIAG] VAD: user started speaking\n")
-                            _df.flush()
-                    except Exception:
-                        pass
                     provider_ref._barge_in_generation += 1
                     provider_ref._barge_in_active = True
                     provider_ref.deps.movement_manager.set_listening(True)

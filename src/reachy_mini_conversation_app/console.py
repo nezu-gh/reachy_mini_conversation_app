@@ -392,15 +392,8 @@ class LocalStream:
                     return
 
         # Start media after key is set/available
-        import builtins as _bb
-        with open("/tmp/diag.log", "a") as _df2:
-            _bb.print("[DIAG] launch: about to start_recording", file=_df2, flush=True)
         self._robot.media.start_recording()
-        with open("/tmp/diag.log", "a") as _df2:
-            _bb.print("[DIAG] launch: start_recording done, about to start_playing", file=_df2, flush=True)
         self._robot.media.start_playing()
-        with open("/tmp/diag.log", "a") as _df2:
-            _bb.print("[DIAG] launch: start_playing done", file=_df2, flush=True)
 
         # Limit queued playback buffers: if audio backs up (e.g. during
         # barge-in), old buffers are automatically dropped.  ~50 buffers
@@ -410,12 +403,8 @@ class LocalStream:
             audio.set_max_output_buffers(50)
 
         time.sleep(1)  # give some time to the pipelines to start
-        with open("/tmp/diag.log", "a") as _df2:
-            _bb.print("[DIAG] launch: about to asyncio.run(runner())", file=_df2, flush=True)
 
         async def runner() -> None:
-            with open("/tmp/diag.log", "a") as _df2:
-                _bb.print("[DIAG] runner() started", file=_df2, flush=True)
             # Capture loop for cross-thread personality actions
             loop = asyncio.get_running_loop()
             self._asyncio_loop = loop  # type: ignore[assignment]
@@ -513,7 +502,6 @@ class LocalStream:
         """Read mic frames from the recorder and forward them to the handler."""
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
         logger.info("Audio recording started at %d Hz", input_sample_rate)
-        import builtins as _b; _diag = open("/tmp/diag.log", "a"); _b.print(f"[DIAG] record_loop started, sample_rate={input_sample_rate}", file=_diag, flush=True)
 
         _consecutive_errors = 0
         _frame_count = 0
@@ -524,8 +512,11 @@ class LocalStream:
                 )
                 if audio_frame is not None:
                     _frame_count += 1
-                    if _frame_count <= 5 or _frame_count % 100 == 0:
-                        _b.print(f"[DIAG] record_loop frame #{_frame_count} shape={audio_frame.shape} dtype={audio_frame.dtype}", file=_diag, flush=True)
+                    if _frame_count <= 3 or _frame_count % 500 == 0:
+                        logger.info(
+                            "record_loop: frame #%d shape=%s dtype=%s",
+                            _frame_count, audio_frame.shape, audio_frame.dtype,
+                        )
                     await self.handler.receive((input_sample_rate, audio_frame))
                 _consecutive_errors = 0
             except asyncio.CancelledError:

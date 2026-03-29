@@ -63,11 +63,6 @@ def run(
 
     logger = setup_logger(args.debug)
     logger.info("Starting Reachy Mini Conversation App")
-    def _diag(msg: str) -> None:
-        with open("/tmp/diag.log", "a") as _df:
-            import time as _t; _df.write(f"[DIAG {_t.strftime('%H:%M:%S')}] {msg}\n"); _df.flush()
-
-    _diag(f"run() entered, provider={getattr(args, 'provider', 'unknown')}")
 
     if args.no_camera and args.head_tracker is not None:
         logger.warning(
@@ -123,14 +118,11 @@ def run(
         logger.info("Simulation mode detected. Automatically enabling gradio flag.")
         args.gradio = True
 
-    _diag("camera/vision init starting")
     try:
         camera_worker, vision_processor = initialize_camera_and_vision(args, robot)
     except CameraVisionInitializationError as e:
         logger.error("Failed to initialize camera/vision: %s", e)
         sys.exit(1)
-    _diag(f"camera/vision init done, camera={camera_worker is not None}")
-
     movement_manager = MovementManager(
         current_robot=robot,
         camera_worker=camera_worker,
@@ -157,10 +149,7 @@ def run(
     )
     logger.debug(f"Chatbot avatar images: {chatbot.avatar_images}")
 
-    _diag("building handler")
     handler = _build_handler(getattr(args, "provider", "openai"), deps, args.gradio, instance_path)
-    _diag("handler built")
-
     stream_manager: gr.Blocks | LocalStream | None = None
 
     if args.gradio:
@@ -246,7 +235,6 @@ def run(
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
-    _diag("calling stream_manager.launch()")
     try:
         stream_manager.launch()
     except (KeyboardInterrupt, SystemExit):
