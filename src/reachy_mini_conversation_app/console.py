@@ -416,24 +416,18 @@ class LocalStream:
                 asyncio.create_task(self.play_loop(), name="stream-play-loop"),
             ]
             try:
-                done, pending = await asyncio.wait(
-                    self._tasks, return_when=asyncio.FIRST_EXCEPTION,
+                results = await asyncio.gather(
+                    *self._tasks, return_exceptions=True,
                 )
-                # Log any task that finished with an exception
-                for task in done:
-                    exc = task.exception() if not task.cancelled() else None
-                    if exc is not None:
+                # Log any task that failed
+                for task, result in zip(self._tasks, results):
+                    if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
                         logger.error(
                             "Task %s failed: %s: %s",
                             task.get_name(),
-                            type(exc).__name__,
-                            exc,
+                            type(result).__name__,
+                            result,
                         )
-                # Cancel remaining tasks gracefully
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    await asyncio.wait(pending, timeout=5.0)
             except asyncio.CancelledError:
                 logger.info("Tasks cancelled during shutdown")
             finally:
