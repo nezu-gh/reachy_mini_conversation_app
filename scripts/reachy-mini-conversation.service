@@ -1,0 +1,29 @@
+[Unit]
+Description=Reachy Mini Conversation App
+After=network-online.target reachy-mini-daemon.service
+Wants=network-online.target
+Requires=reachy-mini-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/home/pollen/r3-mn1/scripts/launcher.sh
+Restart=always
+RestartSec=5s
+# Allow 10 restarts in 120s before giving up (prevents tight restart loops)
+StartLimitIntervalSec=120
+StartLimitBurst=10
+User=pollen
+WorkingDirectory=/home/pollen/r3-mn1
+Environment=PYTHONUNBUFFERED=1
+
+# Graceful shutdown: SIGTERM first, SIGKILL after 10s
+KillMode=mixed
+TimeoutStopSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=reachy-conversation
+
+[Install]
+WantedBy=multi-user.target

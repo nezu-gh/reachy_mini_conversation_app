@@ -3,6 +3,7 @@
 import os
 import sys
 import time
+import signal
 import asyncio
 import argparse
 import threading
@@ -216,10 +217,22 @@ def run(
     if app_stop_event:
         threading.Thread(target=poll_stop_event, daemon=True).start()
 
+    # Handle SIGTERM (from systemd) the same as KeyboardInterrupt
+    def _sigterm_handler(signum: int, frame: Any) -> None:
+        logger.info("Received SIGTERM, initiating shutdown...")
+        if stream_manager is not None:
+            try:
+                stream_manager.close()
+            except Exception:
+                pass
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     try:
         stream_manager.launch()
-    except KeyboardInterrupt:
-        logger.info("Keyboard interruption in main thread... closing server.")
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Shutdown signal received, closing server.")
     finally:
         movement_manager.stop()
         head_wobbler.stop()
