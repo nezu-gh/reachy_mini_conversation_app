@@ -197,6 +197,14 @@ def run(
             instance_path=instance_path,
         )
 
+    # Wake the robot up so it's ready to interact
+    try:
+        robot.enable_motors()
+        robot.wake_up()
+        logger.info("Robot woke up successfully")
+    except Exception as e:
+        logger.warning("Failed to wake up robot: %s", e)
+
     # Each async service → its own thread/loop
     movement_manager.start()
     head_wobbler.start()
@@ -238,6 +246,13 @@ def run(
         head_wobbler.stop()
         if camera_worker:
             camera_worker.stop()
+
+        # Put robot to sleep before shutting down
+        try:
+            robot.goto_sleep()
+            robot.disable_motors()
+        except Exception as e:
+            logger.debug(f"Error during robot sleep: {e}")
 
         # Ensure media is explicitly closed before disconnecting
         try:

@@ -510,15 +510,16 @@ class LocalStream:
                 input_sample_rate, audio_data = handler_output
                 output_sample_rate = self._robot.media.get_output_audio_samplerate()
 
-                # Cast to float32 (MediaManager handles channel adaptation)
-                audio_frame = audio_to_float32(audio_data)
+                # Cast to float32 and flatten to 1-D (PipelineSink
+                # emits shape (1, N); resample/push need a flat array).
+                audio_frame = audio_to_float32(audio_data).ravel()
 
                 # Resample if needed
                 if input_sample_rate != output_sample_rate:
-                    audio_frame = resample(
-                        audio_frame,
-                        int(len(audio_frame) * output_sample_rate / input_sample_rate),
-                    )
+                    num_samples = int(len(audio_frame) * output_sample_rate / input_sample_rate)
+                    if num_samples < 1:
+                        continue  # skip tiny fragments that can't be resampled
+                    audio_frame = resample(audio_frame, num_samples)
 
                 # Double-check barge-in right before pushing to speaker
                 if getattr(self.handler, "_barge_in", False):
