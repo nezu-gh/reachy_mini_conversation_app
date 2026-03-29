@@ -692,13 +692,10 @@ class PipecatProvider(ConversationProvider):
                             audio = audio.astype(np.int16)
 
                     # Apply noise reduction before VAD/STT
-                    if _nr_available and audio.size > 0:
-                        try:
-                            audio_f = audio.astype(np.float32) / 32767.0
-                            audio_f = nr.reduce_noise(y=audio_f, sr=sr, stationary=True, prop_decrease=0.75)
-                            audio = np.clip(audio_f * 32767, -32768, 32767).astype(np.int16)
-                        except Exception:
-                            pass  # non-fatal — use unfiltered audio
+                    # noisereduce needs ≥1024 samples (scipy welch nperseg);
+                    # real-time chunks are typically 320 samples (20ms @ 16kHz),
+                    # so skip noise reduction for now — it corrupts short frames.
+                    # TODO: accumulate a buffer of ≥1024 samples before filtering.
 
                     audio_bytes = audio.tobytes()
                     frame = InputAudioRawFrame(
