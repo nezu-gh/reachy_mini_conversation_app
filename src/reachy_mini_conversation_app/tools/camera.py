@@ -1,6 +1,7 @@
 import base64
 import asyncio
 import logging
+import os
 from typing import Any, Dict
 
 import cv2
@@ -63,9 +64,24 @@ class Camera(Tool):
                 else {"error": "vision returned non-string"}
             )
 
-        # No vision processor available — return an error instead of
-        # dumping a raw base64 image into the text-only LLM context.
-        logger.warning("camera: no vision processor, cannot analyse image")
+        # No local vision processor — check if LLM is multimodal and can
+        # handle images directly (e.g., Qwen3.5 with vision support).
+        _multimodal_patterns = ("vlm", "vl-", "vision", "llava", "smolvlm", "qwen3.5")
+        model_name = os.environ.get("MODEL_NAME", "").lower()
+        is_multimodal = (
+            os.environ.get("LLM_MULTIMODAL", "").lower() in ("1", "true", "yes")
+            or any(p in model_name for p in _multimodal_patterns)
+        )
+
+        if is_multimodal:
+            # Encode frame as base64 JPEG for the multimodal LLM
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
+                b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+                logger.info("camera: returning base64 image for multimodal LLM")
+                return {"b64_im": b64, "question": question}
+
+        logger.warning("camera: no vision processor and LLM is not multimodal")
         return {
             "error": "Vision is not available. I took a picture but I cannot "
                      "analyse it because no vision model is configured. "

@@ -1,6 +1,6 @@
 """Tests for the camera tool."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -10,8 +10,8 @@ from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 
 
 @pytest.mark.asyncio
-async def test_camera_tool_returns_error_without_vision_processor() -> None:
-    """Without a vision processor the tool should refuse to dump raw base64."""
+async def test_camera_tool_returns_error_without_vision_on_text_only_llm() -> None:
+    """Text-only LLM without a vision processor should return an error."""
     camera_worker = MagicMock()
     camera_worker.get_latest_frame.return_value = np.full((32, 32, 3), [0, 0, 255], dtype=np.uint8)
 
@@ -21,10 +21,48 @@ async def test_camera_tool_returns_error_without_vision_processor() -> None:
         camera_worker=camera_worker,
     )
 
-    result = await Camera()(deps, question="What color is this?")
+    with patch.dict("os.environ", {"MODEL_NAME": "phi-3-mini", "LLM_MULTIMODAL": ""}):
+        result = await Camera()(deps, question="What color is this?")
 
     assert "error" in result
     assert "vision" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_camera_tool_returns_b64_for_multimodal_llm() -> None:
+    """Multimodal LLM should get base64 image when no vision processor."""
+    camera_worker = MagicMock()
+    camera_worker.get_latest_frame.return_value = np.full((32, 32, 3), [0, 0, 255], dtype=np.uint8)
+
+    deps = ToolDependencies(
+        reachy_mini=MagicMock(),
+        movement_manager=MagicMock(),
+        camera_worker=camera_worker,
+    )
+
+    with patch.dict("os.environ", {"MODEL_NAME": "Qwen3.5-35B", "LLM_MULTIMODAL": ""}):
+        result = await Camera()(deps, question="What color is this?")
+
+    assert "b64_im" in result
+    assert "question" in result
+
+
+@pytest.mark.asyncio
+async def test_camera_tool_multimodal_env_override() -> None:
+    """LLM_MULTIMODAL=1 should force multimodal mode regardless of model name."""
+    camera_worker = MagicMock()
+    camera_worker.get_latest_frame.return_value = np.full((32, 32, 3), [0, 0, 255], dtype=np.uint8)
+
+    deps = ToolDependencies(
+        reachy_mini=MagicMock(),
+        movement_manager=MagicMock(),
+        camera_worker=camera_worker,
+    )
+
+    with patch.dict("os.environ", {"MODEL_NAME": "some-text-only-model", "LLM_MULTIMODAL": "1"}):
+        result = await Camera()(deps, question="What do you see?")
+
+    assert "b64_im" in result
 
 
 @pytest.mark.asyncio
@@ -64,8 +102,6 @@ async def test_camera_tool_returns_error_without_frame() -> None:
         camera_worker=camera_worker,
     )
 
-    # Patch capture_frame at its source module so the lazy import picks it up
-    from unittest.mock import patch
     with patch("reachy_mini_conversation_app.camera_capture.capture_frame", return_value=None):
         result = await Camera()(deps, question="What do you see?")
 

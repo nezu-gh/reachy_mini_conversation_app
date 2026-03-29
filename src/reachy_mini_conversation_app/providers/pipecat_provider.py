@@ -981,9 +981,12 @@ class PipecatProvider(ConversationProvider):
         source = PipelineSource()
         asr_cleaner = ASRTextCleaner()
 
-        # Detect multimodal LLM by model name patterns
-        _multimodal_patterns = ("vlm", "vl-", "vision", "llava", "smolvlm")
-        _is_multimodal = any(p in LLM_MODEL.lower() for p in _multimodal_patterns)
+        # Detect multimodal LLM by model name patterns or env var override
+        _multimodal_patterns = ("vlm", "vl-", "vision", "llava", "smolvlm", "qwen3.5")
+        _is_multimodal = (
+            os.environ.get("LLM_MULTIMODAL", "").lower() in ("1", "true", "yes")
+            or any(p in LLM_MODEL.lower() for p in _multimodal_patterns)
+        )
         vision_injector = VisionInjector(multimodal=_is_multimodal)
 
         _has_vision = _is_multimodal or provider_ref.deps.vision_processor is not None
