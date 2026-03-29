@@ -726,10 +726,12 @@ class PipecatProvider(ConversationProvider):
 
                     _src_count += 1
                     if _src_count <= 3 or _src_count % 500 == 0:
-                        logger.info(
-                            "PipelineSource: frame #%d sr=%d samples=%d max=%d",
-                            _src_count, sr, len(audio), int(np.abs(audio).max()),
-                        )
+                        try:
+                            with open("/tmp/diag.log", "a") as _df:
+                                _df.write(f"[DIAG] PipelineSource: frame #{_src_count} sr={sr} samples={len(audio)} max={int(np.abs(audio).max())}\n")
+                                _df.flush()
+                        except Exception:
+                            pass
 
                     audio_bytes = audio.tobytes()
                     frame = InputAudioRawFrame(
@@ -1129,6 +1131,12 @@ class PipecatProvider(ConversationProvider):
                 # The robot should always be listening when idle — only
                 # TTS playback (above) temporarily clears the flag.
                 elif isinstance(frame, VADUserStartedSpeakingFrame):
+                    try:
+                        with open("/tmp/diag.log", "a") as _df:
+                            _df.write("[DIAG] VAD: user started speaking\n")
+                            _df.flush()
+                    except Exception:
+                        pass
                     provider_ref._barge_in_generation += 1
                     provider_ref._barge_in_active = True
                     provider_ref.deps.movement_manager.set_listening(True)
