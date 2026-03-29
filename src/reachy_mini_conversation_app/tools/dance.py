@@ -65,7 +65,10 @@ class Dance(Tool):
             return {"error": "Dance system not available"}
 
         move_name = kwargs.get("move")
-        repeat = int(kwargs.get("repeat", 1))
+        try:
+            repeat = max(1, min(int(kwargs.get("repeat", 1)), 10))
+        except (ValueError, TypeError):
+            repeat = 1
 
         logger.info("Tool call: dance move=%s repeat=%d", move_name, repeat)
 

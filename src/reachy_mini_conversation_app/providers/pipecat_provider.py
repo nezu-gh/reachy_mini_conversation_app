@@ -113,6 +113,7 @@ class PipecatProvider(ConversationProvider):
         self.last_activity_time: float = 0.0
         self.start_time: float = 0.0
         self._barge_in: bool = False
+        self._barge_in_time: float = 0.0
 
     # ------------------------------------------------------------------
     # ConversationProvider abstract methods
@@ -190,14 +191,11 @@ class PipecatProvider(ConversationProvider):
         """
         while True:
             # Safety: if _barge_in has been stuck for >3s, force-clear it.
+            now = asyncio.get_event_loop().time()
             if self._barge_in:
-                if not hasattr(self, "_barge_in_time"):
-                    self._barge_in_time = asyncio.get_event_loop().time()
-                elif asyncio.get_event_loop().time() - self._barge_in_time > 3.0:
+                if now - self._barge_in_time > 3.0:
                     logger.warning("_barge_in stuck for >3s, force-clearing")
                     self._barge_in = False
-            if not self._barge_in and hasattr(self, "_barge_in_time"):
-                del self._barge_in_time
 
             idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
             if idle_duration > 15.0 and self.deps.movement_manager.is_idle():
@@ -643,7 +641,7 @@ class PipecatProvider(ConversationProvider):
         # Also catch markdown-style expressions the LLM sometimes writes
         # e.g. "*Micro-expression: laugh*" or "*micro-expression: happy*"
         _MARKDOWN_EXPR_RE = re.compile(
-            r'\*[Mm]icro[- ]expression:\s*(\w+)\*',
+            r'\*[Mm]icro[- _]expression:\s*(\w+)\*',
         )
 
         class AssistantTextTap(FrameProcessor):
@@ -669,9 +667,6 @@ class PipecatProvider(ConversationProvider):
                             await provider_ref.output_queue.put(
                                 AdditionalOutputs({"role": "assistant", "content": text})
                             )
-                        else:
-                            # Pure tool-call text, nothing left for TTS
-                            return
                 await self.push_frame(frame, direction)
 
             async def _intercept_tool_text(self, text: str) -> str:
@@ -788,6 +783,7 @@ class PipecatProvider(ConversationProvider):
                 # TTS playback (above) temporarily clears the flag.
                 elif isinstance(frame, VADUserStartedSpeakingFrame):
                     provider_ref._barge_in = True
+                    provider_ref._barge_in_time = asyncio.get_event_loop().time()
                     provider_ref.deps.movement_manager.set_listening(True)
                     if provider_ref.deps.head_wobbler is not None:
                         provider_ref.deps.head_wobbler.reset()

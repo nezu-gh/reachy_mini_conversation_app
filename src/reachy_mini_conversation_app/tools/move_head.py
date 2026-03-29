@@ -65,7 +65,7 @@ class MoveHead(Tool):
                     current_antennas[1],
                 ),  # Skip body_yaw
                 target_body_yaw=0,  # Reset body yaw
-                start_body_yaw=current_antennas[0],  # body_yaw is first in joint positions
+                start_body_yaw=0,  # Default; SDK doesn't expose body_yaw separately
                 duration=deps.motion_duration_s,
             )
 
@@ -75,5 +75,5 @@ class MoveHead(Tool):
             return {"status": f"looking {direction}"}
 
         except Exception as e:
-            logger.error("move_head failed")
+            logger.exception("move_head failed")
             return {"error": f"move_head failed: {type(e).__name__}: {e}"}
