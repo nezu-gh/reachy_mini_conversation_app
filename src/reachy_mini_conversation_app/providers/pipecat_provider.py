@@ -388,12 +388,7 @@ class PipecatProvider(ConversationProvider):
             """
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
-                if isinstance(frame, TranscriptionFrame):
-                    text = getattr(frame, "text", "")
-                    cleaned = text.replace("<asr_text>", "").strip()
-                    if cleaned != text:
-                        frame.text = cleaned
-                elif isinstance(frame, InterimTranscriptionFrame):
+                if isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
                     text = getattr(frame, "text", "")
                     cleaned = text.replace("<asr_text>", "").strip()
                     if cleaned != text:
