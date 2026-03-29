@@ -392,8 +392,15 @@ class LocalStream:
                     return
 
         # Start media after key is set/available
+        import builtins as _bb
+        with open("/tmp/diag.log", "a") as _df2:
+            _bb.print("[DIAG] launch: about to start_recording", file=_df2, flush=True)
         self._robot.media.start_recording()
+        with open("/tmp/diag.log", "a") as _df2:
+            _bb.print("[DIAG] launch: start_recording done, about to start_playing", file=_df2, flush=True)
         self._robot.media.start_playing()
+        with open("/tmp/diag.log", "a") as _df2:
+            _bb.print("[DIAG] launch: start_playing done", file=_df2, flush=True)
 
         # Limit queued playback buffers: if audio backs up (e.g. during
         # barge-in), old buffers are automatically dropped.  ~50 buffers
