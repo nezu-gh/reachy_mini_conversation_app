@@ -12,6 +12,7 @@ The upstream OpenAI Realtime API path is preserved as the default/fallback provi
 - [Infrastructure](#infrastructure)
 - [Provider System](#provider-system)
 - [Pipecat Pipeline](#pipecat-pipeline)
+- [Micro-Expressions](#micro-expressions)
 - [MCP Servers](#mcp-servers)
 - [Profile System](#profile-system)
 - [Configuration](#configuration)
@@ -215,6 +216,58 @@ Intercepts multiple frame types at the end of the pipeline:
 | `InterimTranscriptionFrame` | Push partial transcript to output queue |
 | `VADUserStartedSpeakingFrame` | Set listening=True, drain output queue (barge-in) |
 | `VADUserStoppedSpeakingFrame` | Keep listening=True (stay attentive between utterances) |
+
+---
+
+## Micro-Expressions
+
+Non-verbal sounds the robot plays as quick emotional reactions — faster and more natural than generating full TTS for simple acknowledgments.
+
+### Sound Library (`audio/sound_library.py`)
+
+Procedurally generates 8 expression sounds using sine waves, frequency sweeps, harmonics, vibrato, and smooth amplitude envelopes. All output at 24 kHz int16 mono.
+
+| Expression | Duration | Character |
+|------------|----------|-----------|
+| `acknowledge` | 260ms | Rising two-note — "mm-hmm" |
+| `think` | 500ms | Sustained hum with vibrato |
+| `surprise` | 200ms | Quick upward frequency sweep |
+| `happy` | 225ms | Bright ascending double chirp |
+| `sad` | 350ms | Slow descending tone |
+| `curious` | 300ms | Rising inflection (question tone) |
+| `laugh` | 360ms | Bouncing alternating pitches |
+| `concerned` | 400ms | Low wavering pulse |
+
+**Custom overrides:** Place a WAV file named `<expression>.wav` in `src/reachy_mini_conversation_app/sounds/` to override any procedural default. Extra WAVs with new names are also loaded automatically.
+
+### Micro-Expression Tool (`tools/micro_expression.py`)
+
+LLM-callable tool that:
+1. Loads the sound from `SoundLibrary`
+2. Feeds the audio to `HeadWobbler` (base64 PCM) for synchronized head movement
+3. Pushes 20ms audio chunks to `output_queue` for the robot speaker
+4. Returns immediately — non-blocking, interruptible via barge-in
+
+The tool accesses `output_queue` and `head_wobbler` through `ToolDependencies`, which are wired by the pipecat provider after pipeline creation.
+
+### Usage in Profile
+
+The `r3_mn1` profile instructs the LLM to:
+- Use `micro_expression` **instead of speech** for simple reactions (e.g., user says "thanks" → play `acknowledge` instead of "You're welcome")
+- Use `micro_expression` **before speech** for immediate emotion (e.g., surprising news → play `surprise`, then comment)
+- Use `play_emotion` naturally during conversation to express physical emotions (happiness, curiosity, etc.)
+- Vary response length: sometimes just a sound, sometimes a short sentence, sometimes a full answer
+
+### Audio Flow for Micro-Expressions
+
+```
+LLM tool call → micro_expression("surprise")
+    → SoundLibrary.get("surprise") → int16 PCM (200ms)
+    → HeadWobbler.feed(base64) → synchronized head movement
+    → output_queue.put(20ms chunks) → robot speaker
+```
+
+This bypasses the entire TTS pipeline. A micro-expression plays in ~10ms from tool invocation, compared to ~2.4s for the full STT→LLM→TTS path.
 
 ---
 
@@ -470,6 +523,8 @@ All changes from the initial upstream fork to the current state:
 | 25 | `a4bc945` | Smart-turn VAD gate and TTS text chunker |
 | 26 | `fbc3821` | Per-turn vision injection, built-in smart-turn, fix barge-in |
 | 27 | `632f376` | Make VisionInjector model-aware (multimodal vs text-only) |
+| 28 | `54d742e` | Audit: clean up dead code, stale TODOs, update docs |
+| 29 | `9e8e2be` | Non-verbal micro-expression sounds for natural reactions |
 
 ---
 
@@ -485,7 +540,7 @@ All changes from the initial upstream fork to the current state:
 ### What Works Now
 
 - Full STT→LLM→TTS pipeline (Qwen-ASR + Qwen3.5-35B + Qwen3-TTS) tested end-to-end
-- 9 robot tools registered: dance, stop_dance, play_emotion, stop_emotion, move_head, camera, do_nothing, task_cancel, task_status
+- 10 robot tools registered: dance, stop_dance, play_emotion, stop_emotion, move_head, camera, do_nothing, micro_expression, task_cancel, task_status
 - Robot connected at 192.168.178.127 (movements, emotions, head control)
 - Gradio UI at http://0.0.0.0:7860 for browser-based audio interaction
 - LLM TTFB: 0.3s (thinking disabled via chat_template_kwargs)
@@ -493,6 +548,7 @@ All changes from the initial upstream fork to the current state:
 - Per-turn vision injection (VisionInjector: multimodal image for VLMs, text description for text-only LLMs)
 - TTS text chunking (waterfall split at sentence/clause/phrase/word boundaries, max 150 chars)
 - Smart Turn v3.2 turn-completion detection (pipecat built-in ONNX model)
+- Non-verbal micro-expressions (8 procedural sounds) for quick emotional reactions, bypassing TTS
 - Camera capture via unixfdsrc socket (1280×720 YUY2 from daemon) and subprocess fallback
 
 ### Camera Fix (v4l2h264enc → openh264enc)
