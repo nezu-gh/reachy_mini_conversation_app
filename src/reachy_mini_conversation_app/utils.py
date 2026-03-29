@@ -46,8 +46,8 @@ def parse_args() -> tuple[argparse.Namespace, list]:  # type: ignore
     parser.add_argument(
         "--provider",
         choices=["openai", "pipecat"],
-        default="openai",
-        help="Conversation backend. 'pipecat' requires the local_pipeline extra.",
+        default=os.environ.get("PROVIDER", "openai"),
+        help="Conversation backend. 'pipecat' requires the local_pipeline extra. Env: PROVIDER",
     )
     return parser.parse_known_args()
 
