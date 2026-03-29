@@ -18,7 +18,10 @@ before it reaches the output queue.
 """
 
 from __future__ import annotations
+import io
 import os
+import re
+import wave
 import base64
 import asyncio
 import logging
@@ -60,6 +63,11 @@ TTS_MODEL = os.environ.get("TTS_MODEL", "qwen3-tts")
 
 ASR_BASE_URL = os.environ.get("ASR_BASE_URL", f"http://{_DEFAULT_VM}:8015/v1")
 ASR_MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
+
+# Optional smart-turn VAD endpoint (Flask server with ONNX turn-completion model).
+# When set, the pipeline holds VADUserStoppedSpeakingFrame until the model
+# confirms the user's turn is complete.  When unset, Silero VAD alone decides.
+SMART_TURN_URL = os.environ.get("SMART_TURN_URL", "")
 
 # ---------------------------------------------------------------------------
 # Audio constants
@@ -395,6 +403,177 @@ class PipecatProvider(ConversationProvider):
                         frame.text = cleaned
                 await self.push_frame(frame, direction)
 
+        class SmartTurnGate(FrameProcessor):
+            """Hold VADUserStoppedSpeakingFrame until a smart-turn model
+            confirms the user's turn is complete.
+
+            Buffers recent InputAudioRawFrame data.  When Silero VAD fires
+            a stop-speaking event, the accumulated audio is sent to an
+            external smart-turn endpoint.  If the model says "incomplete",
+            the stop-speaking frame is suppressed and the pipeline keeps
+            listening.  If "complete" (or no endpoint configured), the
+            frame passes through normally.
+            """
+
+            def __init__(self, endpoint: str, sample_rate: int = 16000) -> None:
+                super().__init__()
+                self._endpoint = endpoint.rstrip("/") if endpoint else ""
+                self._sample_rate = sample_rate
+                self._audio_chunks: list[bytes] = []
+                self._max_seconds = 8  # smart-turn model uses last 8s
+
+            async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                # Buffer raw audio for the turn-completion check
+                if isinstance(frame, InputAudioRawFrame):
+                    self._audio_chunks.append(frame.audio)
+                    # Cap buffer at max_seconds worth of audio
+                    max_bytes = self._sample_rate * 2 * self._max_seconds  # 16-bit mono
+                    total = sum(len(c) for c in self._audio_chunks)
+                    while total > max_bytes and len(self._audio_chunks) > 1:
+                        total -= len(self._audio_chunks.pop(0))
+                    await self.push_frame(frame, direction)
+                    return
+
+                if isinstance(frame, VADUserStartedSpeakingFrame):
+                    self._audio_chunks.clear()
+                    await self.push_frame(frame, direction)
+                    return
+
+                if isinstance(frame, VADUserStoppedSpeakingFrame):
+                    if not self._endpoint or not self._audio_chunks:
+                        await self.push_frame(frame, direction)
+                        return
+
+                    # Check with smart-turn model
+                    is_complete = await self._check_turn_complete()
+                    if is_complete:
+                        logger.debug("SmartTurn: turn complete, forwarding stop-speaking")
+                        await self.push_frame(frame, direction)
+                    else:
+                        logger.info("SmartTurn: turn incomplete, suppressing stop-speaking")
+                        # Don't forward — pipeline keeps listening
+                    return
+
+                await self.push_frame(frame, direction)
+
+            async def _check_turn_complete(self) -> bool:
+                """Send buffered audio to the smart-turn endpoint."""
+                try:
+                    import aiohttp
+
+                    pcm = b"".join(self._audio_chunks)
+
+                    # Encode as WAV for the endpoint
+                    buf = io.BytesIO()
+                    with wave.open(buf, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(self._sample_rate)
+                        wf.writeframes(pcm)
+                    audio_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"{self._endpoint}/predict",
+                            json={"audio_base64": audio_b64},
+                            timeout=aiohttp.ClientTimeout(total=3.0),
+                        ) as resp:
+                            if resp.status == 200:
+                                result = await resp.json()
+                                prediction = result.get("prediction", 1)
+                                prob = result.get("probability", 1.0)
+                                logger.debug(
+                                    "SmartTurn: prediction=%d probability=%.2f",
+                                    prediction, prob,
+                                )
+                                return prediction == 1
+                            logger.warning("SmartTurn: HTTP %d", resp.status)
+                            return True
+                except ImportError:
+                    logger.warning("SmartTurn: aiohttp not installed, passing through")
+                    return True
+                except Exception as e:
+                    logger.warning("SmartTurn: check failed (%s), passing through", e)
+                    return True
+
+        class TTSTextChunker(FrameProcessor):
+            """Split long LLM text into TTS-friendly chunks for faster
+            time-to-first-audio.
+
+            Uses a waterfall approach: sentence boundaries → clause
+            boundaries → phrase boundaries → word boundaries, with a
+            configurable max chunk size.
+            """
+
+            _WATERFALL = [
+                re.compile(r'([.!?…]+["\'\)]?\s+)'),  # sentence endings
+                re.compile(r'([:;]\s+)'),               # clause separators
+                re.compile(r'([,—]\s+)'),               # phrase separators
+                re.compile(r'(\s+)'),                    # any whitespace
+            ]
+
+            def __init__(self, max_chars: int = 150) -> None:
+                super().__init__()
+                self._max_chars = max_chars
+
+            async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                if not isinstance(frame, TTSTextFrame):
+                    await self.push_frame(frame, direction)
+                    return
+
+                text = getattr(frame, "text", "").strip()
+                if not text:
+                    await self.push_frame(frame, direction)
+                    return
+
+                chunks = self._split(text)
+                for chunk in chunks:
+                    await self.push_frame(
+                        TTSTextFrame(text=chunk), direction,
+                    )
+
+            def _split(self, text: str) -> list[str]:
+                if len(text) <= self._max_chars:
+                    return [text]
+
+                chunks: list[str] = []
+                remaining = text
+
+                while remaining:
+                    if len(remaining) <= self._max_chars:
+                        chunks.append(remaining.strip())
+                        break
+
+                    best_break = self._find_break(remaining)
+
+                    if best_break and best_break > 20:
+                        chunk = remaining[:best_break].strip()
+                        remaining = remaining[best_break:].strip()
+                    else:
+                        # Force break at a space near max_chars
+                        space_idx = remaining[: self._max_chars].rfind(" ")
+                        if space_idx > 20:
+                            chunk = remaining[:space_idx].strip()
+                            remaining = remaining[space_idx:].strip()
+                        else:
+                            chunk = remaining[: self._max_chars].strip()
+                            remaining = remaining[self._max_chars :].strip()
+
+                    if chunk:
+                        chunks.append(chunk)
+
+                return chunks
+
+            def _find_break(self, text: str) -> int | None:
+                window = text[: self._max_chars + 50]
+                for pattern in self._WATERFALL:
+                    matches = list(pattern.finditer(window))
+                    if matches:
+                        for m in reversed(matches):
+                            if m.end() <= self._max_chars + 20:
+                                return m.end()
+                return None
+
         class AssistantTextTap(FrameProcessor):
             """Taps LLM output text before it reaches TTS.
 
@@ -494,24 +673,34 @@ class PipecatProvider(ConversationProvider):
         # with audio_in/out sample rates from PipelineParams.
         #
         # Pipeline order:
-        #   VAD → STT → user_agg → LLM → text_tap → TTS → sink → assistant_agg
+        #   VAD → SmartTurn → STT → ASRCleaner → user_agg → LLM
+        #     → text_tap → TTSChunker → TTS → sink → assistant_agg
         #
         # PipelineSource runs as a separate asyncio task and injects
         # InputAudioRawFrame via task.queue_frame().
 
         source = PipelineSource()
+        smart_turn = SmartTurnGate(SMART_TURN_URL, sample_rate=PIPELINE_SAMPLE_RATE)
         asr_cleaner = ASRTextCleaner()
+        tts_chunker = TTSTextChunker(max_chars=150)
         text_tap = AssistantTextTap()
         sink = PipelineSink()
+
+        if SMART_TURN_URL:
+            logger.info("SmartTurn VAD enabled: %s", SMART_TURN_URL)
+        else:
+            logger.info("SmartTurn VAD disabled (set SMART_TURN_URL to enable)")
 
         pipeline = Pipeline(
             [
                 vad,            # analyse audio for speech boundaries
+                smart_turn,     # hold stop-speaking until turn is confirmed complete
                 stt,            # transcribe speech segments
                 asr_cleaner,    # strip <asr_text> prefix from Qwen ASR
                 user_agg,       # accumulate user turns
                 llm,            # generate response
                 text_tap,       # capture assistant text before TTS
+                tts_chunker,    # split long text into TTS-friendly chunks
                 tts,            # synthesise speech
                 sink,           # bridge audio + transcripts → fastrtc
                 assistant_agg,  # accumulate assistant turns
