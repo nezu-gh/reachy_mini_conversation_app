@@ -23,6 +23,7 @@ from scipy.signal import resample
 from reachy_mini import ReachyMini
 from reachy_mini.media.media_manager import MediaBackend
 from reachy_mini_conversation_app.config import LOCKED_PROFILE, config
+from reachy_mini_conversation_app.dashboard_api import mount_dashboard_routes
 from reachy_mini_conversation_app.headless_personality_ui import mount_personality_routes
 
 
@@ -241,10 +242,12 @@ class LocalStream:
         class ApiKeyPayload(BaseModel):
             openai_api_key: str
 
-        # GET / -> index.html
+        # GET / -> dashboard.html
+        dashboard_file = static_dir / "dashboard.html"
+
         @self._settings_app.get("/")
         def _root() -> FileResponse:
-            return FileResponse(str(index_file))
+            return FileResponse(str(dashboard_file))
 
         # GET /favicon.ico -> optional, avoid noisy 404s on some browsers
         @self._settings_app.get("/favicon.ico")
@@ -401,6 +404,7 @@ class LocalStream:
                         persist_personality=self._persist_personality,
                         get_persisted_personality=self._read_persisted_personality,
                     )
+                    mount_dashboard_routes(self._settings_app, self.handler)
             except Exception:
                 pass
             self._tasks = [
