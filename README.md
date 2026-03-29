@@ -202,7 +202,10 @@ uv sync --extra local_pipeline
 PROVIDER=pipecat LOCAL_VM_IP=192.168.1.100 reachy-mini-conversation-app
 ```
 
-**Pipeline:** `Silero VAD → STT → ASR filter → Context trimmer → LLM → TTS → Audio output`
+**Pipeline:** `VAD → STT → ASRCleaner → UserAgg → ContextTrimmer → ParallelEnricher(memory+vision) → IntentRouter → LLM → TTSChunker → TTS → Sink → AssistantAgg → AutoMemoryTap`
+
+> [!TIP]
+> The `r3_mn1` profile is optimized for local pipeline operation. It includes conversational rhythm, memory, idle behavior, and emotional awareness instructions. Activate with `REACHY_MINI_CUSTOM_PROFILE=r3_mn1` or copy `.env.r3mn1` to `.env`.
 
 ### Features
 
@@ -213,6 +216,14 @@ PROVIDER=pipecat LOCAL_VM_IP=192.168.1.100 reachy-mini-conversation-app
 - **TTS warm-up** — Background request primes the TTS model to eliminate first-utterance latency.
 - **Micro-expression sounds** — Procedural audio cues (happy, sad, thinking, surprised, etc.) played via the `micro_expression` tool. Sounds are generated algorithmically with no WAV files required, but can be overridden by placing WAV files in a `sounds/` directory.
 - **DoA speaker tracking** — When `ENABLE_DOA_TRACKING=1` is set and a ReSpeaker mic array is connected, the robot's head gently orients toward the speaker using Direction of Arrival readings. Smoothed with an exponential moving average, clamped to ±15 degrees.
+- **Conversation memory** — Stores and retrieves facts via OpenMemory (Mem0). Auto-extracts facts from conversation. LLM tools `store_memory` and `recall_memory` for explicit use.
+- **Intent-based LLM routing** — Pattern-based classifier routes casual intents to an optional fast model, complex queries to the full model.
+- **Parallel memory+vision enrichment** — Memory search and camera capture run concurrently via `asyncio.gather()` before each LLM turn.
+- **Audio noise suppression** — Optional `noisereduce` filter before VAD reduces background noise.
+- **Smart interruptions** — Minimum 3-word threshold prevents single-word backchannel from interrupting the robot.
+- **Pipeline observability** — TTFB tracking, rolling averages, token usage, pipeline events exposed via `/api/metrics`.
+- **Proactive idle engagement** — Tiered idle signals trigger robot actions when nobody is talking.
+- **WebRTC voice chat** — Browser-based voice conversation at `/webrtc` (up to 2 concurrent sessions).
 
 ## LLM tools exposed to the assistant
 

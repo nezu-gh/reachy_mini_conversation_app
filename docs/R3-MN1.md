@@ -35,6 +35,8 @@ The upstream OpenAI Realtime API path is preserved as the default/fallback provi
 
 ## Architecture Overview
 
+> See also: [Interactive system diagram](scheme.mmd) (Mermaid) for the full component view including both OpenAI and Pipecat provider paths.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Reachy Mini Robot (192.168.178.127)                                │
@@ -128,7 +130,7 @@ Zero-risk bridge. `OpenaiRealtimeHandler` already implements `apply_personality`
 class PipecatProvider(ConversationProvider):
 ```
 
-Fully-local conversation backend powered by pipecat-ai 0.0.108. Raises `RuntimeError` at instantiation if pipecat-ai is not installed.
+Fully-local conversation backend powered by pipecat-ai (tested with 0.0.108, requires >=0.0.49). Raises `RuntimeError` at instantiation if pipecat-ai is not installed.
 
 Key responsibilities:
 - **Audio bridging:** Resamples between fastrtc (24 kHz) and pipecat's internal rate (16 kHz)
@@ -198,6 +200,10 @@ Microphone (24 kHz) → fastrtc receive() → resample 24→16 kHz → _audio_in
     → PipelineSink → resample if needed → HeadWobbler (24 kHz) → output_queue
     → fastrtc emit() → Speaker (24 kHz)
 ```
+
+### TTS Warm-Up
+
+A background thread fires a short TTS request at startup (`_warm_up_tts()`) to prime the model. This eliminates the cold-start latency on the first real utterance, which can otherwise be 2-3x slower than subsequent requests.
 
 ### Thinking Model Handling
 
@@ -403,7 +409,7 @@ The robot initiates interaction when idle — subtle at first, more engaging ove
 
 #### Vision-Triggered Greetings
 
-When the VisionInjector detects a scene change (e.g., person appears), the idle signal includes the scene description. The profile instructions tell the LLM to greet newcomers naturally.
+When the ParallelEnricher's vision component detects a scene change (e.g., person appears), the idle signal includes the scene description. The profile instructions tell the LLM to greet newcomers naturally.
 
 **Profile section** (`profiles/r3_mn1/instructions.txt`):
 ```
@@ -713,11 +719,14 @@ cp .env.r3mn1 .env   # or: ln -s .env.r3mn1 .env
 | `MEM0_BASE_URL` | `http://192.168.178.155:8765` | OpenMemory (Mem0) REST API endpoint |
 | `MEM0_USER_ID` | `default` | User ID for memory storage/retrieval |
 | `MEM0_APP_NAME` | `r3mn1` | App name registered with OpenMemory |
+| `LLM_MULTIMODAL` | auto-detected | Force multimodal vision on/off (`1`/`true`/`yes` or `0`/`false`/`no`). Auto-detected from model name if unset. |
 | `LLM_FAST_BASE_URL` | — | Optional fast LLM endpoint for casual intents |
 | `LLM_FAST_MODEL` | — | Optional fast LLM model name |
 | `MIN_INTERRUPT_WORDS` | `3` | Minimum words to trigger speech interruption |
 | `WEBRTC_MAX_CLIENTS` | `2` | Max concurrent WebRTC voice sessions |
 | `WEBRTC_ICE_SERVERS` | `stun:stun.l.google.com:19302` | STUN/TURN servers for WebRTC |
+| `ENABLE_DOA_TRACKING` | `0` | Direction of Arrival speaker tracking (requires ReSpeaker mic array) |
+| `REACHY_ROBOT_NAME` | auto-detect | Robot hostname/IP for SDK discovery (also settable via `--robot-name` CLI flag) |
 | `HA_URL` | `http://192.168.178.77:8123` | Home Assistant URL |
 | `HA_TOKEN` | — | HA long-lived access token |
 
@@ -878,6 +887,30 @@ All changes from the initial upstream fork to the current state:
 | 27 | `632f376` | Make VisionInjector model-aware (multimodal vs text-only) |
 | 28 | `54d742e` | Audit: clean up dead code, stale TODOs, update docs |
 | 29 | `9e8e2be` | Non-verbal micro-expression sounds for natural reactions |
+| 30 | `b38639c` | Micro-expressions docs, pipeline docs update |
+| 31 | `2343ed1` | Fix PROVIDER env var for daemon-launched mode |
+| 32 | `a0facbf` | Load .env from project root when daemon launches from its own CWD |
+| 33 | `0f8064c` | Ensure .env is loaded before parse_args reads PROVIDER |
+| 34 | `270123f` | ASR noise filter, context trimming, health probes, robustness |
+| 35 | `2fa2943` | systemd service for crash recovery and auto-restart |
+| 36 | `2231400` | Dropped frames, regex gaps, tool robustness from stack audit |
+| 37 | `7c5c766` | Test suite, refactoring, and robustness improvements |
+| 38 | `ef96ed4` | DoA speaker tracking and GStreamer backpressure |
+| 39 | `1bb5dd1` | Document local pipeline provider, deployment, and new env vars |
+| 40 | `b399137` | Vision pipeline hardening — frame copy, head tracker guard, GST env |
+| 41 | `2c8b311` | Repair 7 broken tests across vision, console, camera, and config |
+| 42 | `d0514cf` | Enable multimodal vision for Qwen3.5 and other VLMs |
+| 43 | `2d29569` | Web dashboard with status, controls, logs, and config tabs |
+| 44 | `25cf484` | Make dashboard work with ReachyMiniApp base class |
+| 45 | `b73c9f7` | Allow LLM_MULTIMODAL=0 to explicitly disable vision injection |
+| 46 | `d8cbc14` | Flatten 2-D audio array before resample and auto wake/sleep robot |
+| 47 | `5b3b2f9` | Harden pipeline resilience with error boundaries, retry, and timeouts |
+| 48 | `9e698ad` | Use gather(return_exceptions=True) instead of asyncio.wait |
+| 49 | `e2dea15` | Self-review: full pipeline rebuild, error escalation, non-blocking I/O |
+| 50 | `f9b7f3e` | Bounded queues, barge-in generation counter, pipeline health monitoring |
+| 51 | `0eea6d7` | Robot operations scripts (logs, services, shell) |
+| 52 | `f9b9f63` | Pipecat audit — tool call safety, wobbler guard, full service rebuild |
+| 53 | `4758483` | Pipeline augmentations — 8 phases of companion features |
 
 ---
 

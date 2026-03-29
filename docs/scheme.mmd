@@ -5,59 +5,69 @@ config:
     htmlLabels: true
 ---
 flowchart TB
-    User(["<span style='font-size:16px;font-weight:bold;'>User</span><br><span style='font-size:13px;color:#01579b;'>Person interacting with system</span>"]) 
-      -- audio stream --> 
-    UI@{ label: "<span style='font-size:16px;font-weight:bold;'>UI Layer</span><br><span style='font-size:13px;color:#0277bd;'>Gradio/Console</span>" }
+    User(["<span style='font-size:16px;font-weight:bold;'>User</span><br><span style='font-size:13px;color:#01579b;'>Person or Browser</span>"])
+      -- "audio stream" -->
+    UI@{ label: "<span style='font-size:16px;font-weight:bold;'>UI Layer</span><br><span style='font-size:13px;color:#0277bd;'>Gradio / Console / WebRTC</span>" }
 
-    UI -- audio stream --> 
-    OpenAI@{ label: "<span style='font-size:17px;font-weight:bold;'>gpt-realtime API</span><br><span style='font-size:13px; color:#7b1fa2;'>Audio+Tool Calls+Vision</span>" }
+    UI -- "audio (24 kHz)" -->
+    Provider@{ label: "<span style='font-size:16px;font-weight:bold;'>Provider Abstraction</span><br><span style='font-size:12px;color:#0277bd;'>openai_provider | pipecat_provider</span>" }
 
-    OpenAI -- audio stream --> 
-    Motion@{ label: "<span style='font-size:16px;font-weight:bold;'>Motion Control</span><br><span style='font-size:13px;color:#f57f17;'>Audio Sync + Tracking</span>" }
-    
-    OpenAI -- tool calls --> 
-    Handlers@{ label: "<span style='font-size:16px;font-weight:bold;'>Tool Layer</span><br><span style='font-size:12px;color:#f9a825;'>Built-in tools + profile-local tools<br/>+ external tools (optional)</span>" }
+    Provider -- "OpenAI path" -->
+    OpenAI@{ label: "<span style='font-size:17px;font-weight:bold;'>gpt-realtime API</span><br><span style='font-size:13px;color:#7b1fa2;'>Audio + Tool Calls + Vision</span>" }
 
-    Profiles@{ label: "<span style='font-size:16px;font-weight:bold;'>Selected Profile</span><br><span style='font-size:12px;color:#6a1b9a;'>built-in or external<br/>instructions.txt + tools.txt</span>" }
+    Provider -- "Pipecat path (16 kHz)" -->
+    Pipeline@{ label: "<span style='font-size:16px;font-weight:bold;'>Pipecat Pipeline</span><br><span style='font-size:11px;color:#1565c0;'>VAD → STT → ASRCleaner → UserAgg<br/>→ ParallelEnricher(mem+vision)<br/>→ IntentRouter → LLM → TTSChunker<br/>→ TTS → Sink → AutoMemoryTap</span>" }
 
-    Profiles -- defines enabled tools --> Handlers
+    Pipeline -- "queries" -->
+    LocalServices@{ label: "<span style='font-size:15px;font-weight:bold;'>Local VM Services</span><br><span style='font-size:11px;color:#1565c0;'>ASR :8015 | LLM :3443 | TTS :7034</span>" }
 
-    Handlers -- movement 
-    requests --> Motion
+    Pipeline -- "memory search/store" -->
+    Mem0@{ label: "<span style='font-size:14px;font-weight:bold;'>OpenMemory (Mem0)</span><br><span style='font-size:11px;color:#6a1b9a;'>:8765 API | :3001 UI</span>" }
 
-    Handlers -- camera frames, head tracking --> 
+    Pipeline -- "tool calls" -->
+    Handlers@{ label: "<span style='font-size:16px;font-weight:bold;'>Tool Layer</span><br><span style='font-size:11px;color:#f9a825;'>12 tools: dance, emotion, camera,<br/>move_head, micro_expression,<br/>store_memory, recall_memory, ...</span>" }
+
+    OpenAI -- "tool calls" --> Handlers
+
+    Profiles@{ label: "<span style='font-size:16px;font-weight:bold;'>Profile (r3_mn1)</span><br><span style='font-size:11px;color:#6a1b9a;'>instructions.txt + tools.txt</span>" }
+    Profiles -- "defines tools + prompt" --> Handlers
+    Profiles -- "system instruction" --> Pipeline
+
+    Handlers -- "movement requests" -->
+    Motion@{ label: "<span style='font-size:16px;font-weight:bold;'>Motion Control</span><br><span style='font-size:13px;color:#f57f17;'>MovementManager + HeadWobbler</span>" }
+
+    Handlers -- "camera frames" -->
     Camera@{ label: "<span style='font-size:16px;font-weight:bold;'>Camera Worker</span><br><span style='font-size:13px;color:#f57f17;'>Frame Buffer + Head Tracking</span>" }
-    
-    Handlers -. image for 
-    analysis .-> OpenAI
 
-    Camera -- head tracking --> Motion
+    Camera -. "frames" .->
+    Vision@{ label: "<span style='font-size:16px;font-weight:bold;'>Vision Processor</span><br><span style='font-size:13px;color:#7b1fa2;'>SmolVLM2 (optional)</span>" }
 
-    Camera -. frames .-> 
-    Vision@{ label: "<span style='font-size:16px;font-weight:bold;'>Vision Processor</span><br><span style='font-size:13px;color:#7b1fa2;'>Local VLM (optional)</span>" }
+    Robot@{ label: "<span style='font-size:16px;font-weight:bold;'>reachy_mini</span><br><span style='font-size:13px;color:#c62828;'>Robot Hardware</span>" }
+    -- "camera frames" --> Camera
 
-    Vision -. description .-> Handlers
+    Motion -- "commands" --> Robot
 
-    Robot@{ label: "<span style='font-size:16px;font-weight:bold;'>reachy_mini</span><br><span style='font-size:13px;color:#c62828;'>Robot Control Library</span>" } 
-    -- camera 
-    frames --> Camera
+    Provider -- "metrics" -->
+    Dashboard@{ label: "<span style='font-size:15px;font-weight:bold;'>Dashboard API</span><br><span style='font-size:11px;color:#0277bd;'>/api/health | /api/metrics<br/>/api/logs | /api/config</span>" }
 
-    Motion -- commands --> Robot
-
-    Handlers -- results --> OpenAI
-
-     User:::userStyle
-     UI:::uiStyle
-     OpenAI:::aiStyle
-     Motion:::coreStyle
-     Profiles:::toolStyle
-     Handlers:::toolStyle
-     Camera:::coreStyle
-     Vision:::aiStyle
-     Robot:::hardwareStyle
+    User:::userStyle
+    UI:::uiStyle
+    Provider:::uiStyle
+    OpenAI:::aiStyle
+    Pipeline:::aiStyle
+    LocalServices:::serviceStyle
+    Mem0:::serviceStyle
+    Motion:::coreStyle
+    Profiles:::toolStyle
+    Handlers:::toolStyle
+    Camera:::coreStyle
+    Vision:::aiStyle
+    Robot:::hardwareStyle
+    Dashboard:::uiStyle
     classDef userStyle fill:#e1f5fe,stroke:#01579b,stroke-width:3px
     classDef uiStyle fill:#b3e5fc,stroke:#0277bd,stroke-width:2px
     classDef aiStyle fill:#e1bee7,stroke:#7b1fa2,stroke-width:3px
     classDef coreStyle fill:#fff9c4,stroke:#f57f17,stroke-width:2px
     classDef hardwareStyle fill:#ef9a9a,stroke:#c62828,stroke-width:3px
     classDef toolStyle fill:#fffde7,stroke:#f9a825,stroke-width:1px
+    classDef serviceStyle fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
