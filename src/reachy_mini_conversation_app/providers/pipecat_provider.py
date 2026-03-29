@@ -22,6 +22,7 @@ import os
 import re
 import json
 import base64
+import random
 import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, List, Tuple, Optional
@@ -296,12 +297,21 @@ class PipecatProvider(ConversationProvider):
 
         input_sr, audio = frame
 
+        if not isinstance(audio, np.ndarray):
+            logger.warning("receive: expected ndarray, got %s", type(audio).__name__)
+            return
+        if audio.size == 0:
+            return
+
         # Ensure mono
         if audio.ndim == 2:
             if audio.shape[1] > audio.shape[0]:
                 audio = audio.T
             if audio.shape[1] > 1:
                 audio = audio[:, 0]
+
+        # Flatten any remaining extra dimensions
+        audio = audio.ravel()
 
         # Convert float32 [-1.0, 1.0] → int16 [-32768, 32767]
         if audio.dtype == np.float32 or audio.dtype == np.float64:
@@ -310,8 +320,11 @@ class PipecatProvider(ConversationProvider):
         # Resample to pipeline rate
         if input_sr != PIPELINE_SAMPLE_RATE:
             n_samples = int(len(audio) * PIPELINE_SAMPLE_RATE / input_sr)
+            if n_samples < 1:
+                return
             audio = resample(audio, n_samples).astype(np.int16)
 
+        logger.debug("receive: sr=%d dtype=%s samples=%d", PIPELINE_SAMPLE_RATE, audio.dtype, len(audio))
         await self._audio_in_queue.put((PIPELINE_SAMPLE_RATE, audio))
 
     def copy(self) -> "PipecatProvider":
@@ -875,6 +888,10 @@ class PipecatProvider(ConversationProvider):
                     audio_bytes = frame.audio
                     sr = frame.sample_rate
 
+                    if len(audio_bytes) == 0:
+                        await self.push_frame(frame, direction)
+                        return
+
                     provider_ref.deps.movement_manager.set_listening(False)
                     if provider_ref._doa_tracker is not None:
                         provider_ref._doa_tracker.set_enabled(False)
@@ -884,7 +901,11 @@ class PipecatProvider(ConversationProvider):
                     # Qwen3-TTS outputs at ~7% RMS — apply gain to fill
                     # the dynamic range without clipping.  (2.8x ≈ 70% of 4x)
                     pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.int32)
+                    if pcm.size == 0:
+                        await self.push_frame(frame, direction)
+                        return
                     pcm = np.clip(pcm * 2.8, -32768, 32767).astype(np.int16)
+                    logger.debug("PipelineSink: TTS frame sr=%d pcm_samples=%d", sr, len(pcm))
 
                     # Resample to fastrtc 24 kHz if needed (TTS should
                     # already output 24 kHz, but handle mismatches).
@@ -1048,24 +1069,50 @@ class PipecatProvider(ConversationProvider):
         self.deps.output_queue = self.output_queue
         self.deps.audio_sample_rate = FASTRTC_SAMPLE_RATE
 
-        # Kick off the pipeline in a background asyncio task
-        runner = PipelineRunner(handle_sigint=False)
+        # Kick off the pipeline in a background asyncio task with retry
+        max_attempts = 3
 
         async def _run() -> None:
-            try:
-                # Start the source feeder alongside the runner
-                feeder = asyncio.create_task(source.run(task), name="pipecat-source-feeder")
+            nonlocal task, source
+            for attempt in range(1, max_attempts + 1):
+                runner = PipelineRunner(handle_sigint=False)
                 try:
-                    await runner.run(task)
-                finally:
-                    source.stop()
-                    feeder.cancel()
+                    feeder = asyncio.create_task(source.run(task), name="pipecat-source-feeder")
                     try:
-                        await feeder
-                    except asyncio.CancelledError:
-                        pass
-            except Exception:
-                logger.exception("PipecatProvider pipeline crashed")
+                        await runner.run(task)
+                        return  # clean exit
+                    finally:
+                        source.stop()
+                        feeder.cancel()
+                        try:
+                            await feeder
+                        except asyncio.CancelledError:
+                            pass
+                except asyncio.CancelledError:
+                    logger.info("Pipeline cancelled (attempt %d/%d)", attempt, max_attempts)
+                    raise  # don't retry intentional shutdown
+                except Exception:
+                    logger.exception("Pipeline crashed (attempt %d/%d)", attempt, max_attempts)
+                    if attempt < max_attempts:
+                        delay = 2 ** (attempt - 1) + random.uniform(0, 0.5)
+                        logger.info("Retrying pipeline in %.1fs...", delay)
+                        await asyncio.sleep(delay)
+                        # Rebuild source and task for retry
+                        source = PipelineSource()
+                        self._source = source
+                        task = PipelineTask(
+                            pipeline,
+                            params=PipelineParams(
+                                allow_interruptions=True,
+                                audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+                                audio_out_sample_rate=FASTRTC_SAMPLE_RATE,
+                                enable_metrics=True,
+                                enable_usage_metrics=True,
+                            ),
+                        )
+                        self._pipeline_task = task
+                    else:
+                        logger.error("Pipeline failed after %d attempts", max_attempts)
 
         self._runner_task = asyncio.create_task(_run(), name="pipecat-pipeline")
 

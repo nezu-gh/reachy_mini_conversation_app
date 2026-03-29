@@ -747,7 +747,9 @@ class MovementManager:
         # Stop the worker thread first so it doesn't interfere
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join()
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                logger.warning("Move worker thread did not exit within 5s timeout")
             self._thread = None
         logger.debug("Move worker stopped")
 

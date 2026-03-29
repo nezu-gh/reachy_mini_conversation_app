@@ -242,26 +242,20 @@ def run(
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutdown signal received, closing server.")
     finally:
-        movement_manager.stop()
-        head_wobbler.stop()
-        if camera_worker:
-            camera_worker.stop()
-
-        # Put robot to sleep before shutting down
-        try:
-            robot.goto_sleep()
-            robot.disable_motors()
-        except Exception as e:
-            logger.debug(f"Error during robot sleep: {e}")
-
-        # Ensure media is explicitly closed before disconnecting
-        try:
-            robot.media.close()
-        except Exception as e:
-            logger.debug(f"Error closing media during shutdown: {e}")
-
-        # prevent connection to keep alive some threads
-        robot.client.disconnect()
+        # Each cleanup step is independent — one failure must not skip the rest
+        for label, action in [
+            ("movement_manager", movement_manager.stop),
+            ("head_wobbler", head_wobbler.stop),
+            ("camera_worker", lambda: camera_worker.stop() if camera_worker else None),
+            ("robot.goto_sleep", robot.goto_sleep),
+            ("robot.disable_motors", robot.disable_motors),
+            ("robot.media.close", robot.media.close),
+            ("robot.client.disconnect", robot.client.disconnect),
+        ]:
+            try:
+                action()
+            except Exception as e:
+                logger.debug("Cleanup %s failed: %s", label, e)
         time.sleep(1)
         logger.info("Shutdown complete.")
 

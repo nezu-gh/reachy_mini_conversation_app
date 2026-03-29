@@ -416,7 +416,24 @@ class LocalStream:
                 asyncio.create_task(self.play_loop(), name="stream-play-loop"),
             ]
             try:
-                await asyncio.gather(*self._tasks)
+                done, pending = await asyncio.wait(
+                    self._tasks, return_when=asyncio.FIRST_EXCEPTION,
+                )
+                # Log any task that finished with an exception
+                for task in done:
+                    exc = task.exception() if not task.cancelled() else None
+                    if exc is not None:
+                        logger.error(
+                            "Task %s failed: %s: %s",
+                            task.get_name(),
+                            type(exc).__name__,
+                            exc,
+                        )
+                # Cancel remaining tasks gracefully
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.wait(pending, timeout=5.0)
             except asyncio.CancelledError:
                 logger.info("Tasks cancelled during shutdown")
             finally:
@@ -483,50 +500,73 @@ class LocalStream:
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
 
         while not self._stop_event.is_set():
-            audio_frame = self._robot.media.get_audio_sample()
-            if audio_frame is not None:
-                await self.handler.receive((input_sample_rate, audio_frame))
+            try:
+                audio_frame = self._robot.media.get_audio_sample()
+                if audio_frame is not None:
+                    await self.handler.receive((input_sample_rate, audio_frame))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("record_loop: error processing audio frame")
             await asyncio.sleep(0)  # avoid busy loop
 
     async def play_loop(self) -> None:
         """Fetch outputs from the handler: log text and play audio frames."""
         while not self._stop_event.is_set():
-            handler_output = await self.handler.emit()
+            try:
+                handler_output = await self.handler.emit()
 
-            if isinstance(handler_output, AdditionalOutputs):
-                for msg in handler_output.args:
-                    content = msg.get("content", "")
-                    if isinstance(content, str):
-                        logger.info(
-                            "role=%s content=%s",
-                            msg.get("role"),
-                            content if len(content) < 500 else content[:500] + "…",
+                if isinstance(handler_output, AdditionalOutputs):
+                    for msg in handler_output.args:
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            logger.info(
+                                "role=%s content=%s",
+                                msg.get("role"),
+                                content if len(content) < 500 else content[:500] + "…",
+                            )
+
+                elif isinstance(handler_output, tuple):
+                    # Skip audio that was queued before barge-in
+                    if getattr(self.handler, "_barge_in", False):
+                        continue
+                    input_sample_rate, audio_data = handler_output
+
+                    if not hasattr(audio_data, "dtype"):
+                        logger.warning("play_loop: audio_data is not ndarray, skipping")
+                        continue
+
+                    output_sample_rate = self._robot.media.get_output_audio_samplerate()
+
+                    # Cast to float32 and flatten to 1-D (PipelineSink
+                    # emits shape (1, N); resample/push need a flat array).
+                    audio_frame = audio_to_float32(audio_data).ravel()
+
+                    if len(audio_frame) == 0:
+                        continue
+
+                    # Resample if needed
+                    if input_sample_rate != output_sample_rate:
+                        num_samples = int(len(audio_frame) * output_sample_rate / input_sample_rate)
+                        if num_samples < 1:
+                            continue  # skip tiny fragments that can't be resampled
+                        logger.debug(
+                            "play_loop: resampling %d samples %dHz→%dHz (target=%d)",
+                            len(audio_frame), input_sample_rate, output_sample_rate, num_samples,
                         )
+                        audio_frame = resample(audio_frame, num_samples)
 
-            elif isinstance(handler_output, tuple):
-                # Skip audio that was queued before barge-in
-                if getattr(self.handler, "_barge_in", False):
-                    continue
-                input_sample_rate, audio_data = handler_output
-                output_sample_rate = self._robot.media.get_output_audio_samplerate()
+                    # Double-check barge-in right before pushing to speaker
+                    if getattr(self.handler, "_barge_in", False):
+                        continue
+                    self._robot.media.push_audio_sample(audio_frame)
 
-                # Cast to float32 and flatten to 1-D (PipelineSink
-                # emits shape (1, N); resample/push need a flat array).
-                audio_frame = audio_to_float32(audio_data).ravel()
+                else:
+                    logger.debug("Ignoring output type=%s", type(handler_output).__name__)
 
-                # Resample if needed
-                if input_sample_rate != output_sample_rate:
-                    num_samples = int(len(audio_frame) * output_sample_rate / input_sample_rate)
-                    if num_samples < 1:
-                        continue  # skip tiny fragments that can't be resampled
-                    audio_frame = resample(audio_frame, num_samples)
-
-                # Double-check barge-in right before pushing to speaker
-                if getattr(self.handler, "_barge_in", False):
-                    continue
-                self._robot.media.push_audio_sample(audio_frame)
-
-            else:
-                logger.debug("Ignoring output type=%s", type(handler_output).__name__)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("play_loop: error processing output frame")
 
             await asyncio.sleep(0)  # yield to event loop

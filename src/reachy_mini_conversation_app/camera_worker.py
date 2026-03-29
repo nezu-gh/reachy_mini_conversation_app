@@ -90,7 +90,9 @@ class CameraWorker:
         """Stop the camera worker loop."""
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join()
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                logger.warning("Camera worker thread did not exit within 5s timeout")
 
         logger.debug("Camera worker stopped")
 

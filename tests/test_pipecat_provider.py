@@ -1,12 +1,15 @@
 """Tests for pipecat_provider module-level utilities.
 
-Tests health-check probes and service validation. These mock urllib
-so they don't require actual network access or running services.
+Tests health-check probes, service validation, and audio validation.
+These mock urllib so they don't require actual network access or running
+services.
 """
 
+import asyncio
 import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 
 from reachy_mini_conversation_app.providers.pipecat_provider import (
@@ -74,3 +77,48 @@ class TestCheckServices:
         with caplog.at_level(logging.ERROR):
             _check_services()
         assert "still unreachable after 3 attempts" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Audio validation tests for PipecatProvider.receive()
+# ---------------------------------------------------------------------------
+
+def _make_provider():
+    """Create a minimal PipecatProvider with mocked deps for receive() testing."""
+    from reachy_mini_conversation_app.providers.pipecat_provider import PipecatProvider
+
+    deps = MagicMock()
+    deps.vision_processor = None
+    provider = PipecatProvider(deps, gradio_mode=False, instance_path=None)
+    # Simulate a live pipeline so receive() doesn't bail early
+    provider._pipeline_task = MagicMock()
+    provider._audio_in_queue = asyncio.Queue()
+    return provider
+
+
+@pytest.mark.asyncio
+async def test_receive_skips_non_ndarray() -> None:
+    """Passing a non-ndarray should log a warning and not crash."""
+    provider = _make_provider()
+    await provider.receive((16000, "not_an_array"))
+    assert provider._audio_in_queue.empty(), "nothing should be queued for invalid input"
+
+
+@pytest.mark.asyncio
+async def test_receive_skips_empty_array() -> None:
+    """Empty ndarray should be silently skipped."""
+    provider = _make_provider()
+    await provider.receive((16000, np.array([], dtype=np.int16)))
+    assert provider._audio_in_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_receive_converts_float32_to_int16() -> None:
+    """Float32 audio in [-1, 1] should be converted to int16."""
+    provider = _make_provider()
+    audio = np.array([0.0, 0.5, -0.5, 1.0, -1.0], dtype=np.float32)
+    await provider.receive((16000, audio))
+    assert not provider._audio_in_queue.empty()
+    sr, result = provider._audio_in_queue.get_nowait()
+    assert result.dtype == np.int16
+    assert sr == 16000
