@@ -410,8 +410,12 @@ class LocalStream:
             audio.set_max_output_buffers(50)
 
         time.sleep(1)  # give some time to the pipelines to start
+        with open("/tmp/diag.log", "a") as _df2:
+            _bb.print("[DIAG] launch: about to asyncio.run(runner())", file=_df2, flush=True)
 
         async def runner() -> None:
+            with open("/tmp/diag.log", "a") as _df2:
+                _bb.print("[DIAG] runner() started", file=_df2, flush=True)
             # Capture loop for cross-thread personality actions
             loop = asyncio.get_running_loop()
             self._asyncio_loop = loop  # type: ignore[assignment]
