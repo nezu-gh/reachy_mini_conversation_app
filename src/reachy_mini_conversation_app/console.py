@@ -501,15 +501,22 @@ class LocalStream:
     async def record_loop(self) -> None:
         """Read mic frames from the recorder and forward them to the handler."""
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
-        logger.debug(f"Audio recording started at {input_sample_rate} Hz")
+        logger.info("Audio recording started at %d Hz", input_sample_rate)
 
         _consecutive_errors = 0
+        _frame_count = 0
         while not self._stop_event.is_set():
             try:
                 audio_frame = await asyncio.to_thread(
                     self._robot.media.get_audio_sample,
                 )
                 if audio_frame is not None:
+                    _frame_count += 1
+                    if _frame_count <= 3 or _frame_count % 500 == 0:
+                        logger.info(
+                            "record_loop: frame #%d shape=%s dtype=%s",
+                            _frame_count, audio_frame.shape, audio_frame.dtype,
+                        )
                     await self.handler.receive((input_sample_rate, audio_frame))
                 _consecutive_errors = 0
             except asyncio.CancelledError:
