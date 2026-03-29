@@ -97,6 +97,13 @@ def mount_dashboard_routes(
             except Exception:
                 pass
 
+        pipeline_health = {}
+        if hasattr(handler, "get_pipeline_health") and callable(handler.get_pipeline_health):
+            try:
+                pipeline_health = handler.get_pipeline_health()
+            except Exception:
+                pass
+
         return JSONResponse({
             "uptime_s": round(time.time() - _start_time, 1),
             "movement": movement,
@@ -104,6 +111,7 @@ def mount_dashboard_routes(
             "provider": os.environ.get("PROVIDER", "unknown"),
             "model": os.environ.get("MODEL_NAME", "unknown"),
             "multimodal": os.environ.get("LLM_MULTIMODAL", ""),
+            "pipeline": pipeline_health,
         })
 
     # --- GET /api/config ---

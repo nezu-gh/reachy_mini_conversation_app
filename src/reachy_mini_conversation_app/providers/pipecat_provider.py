@@ -242,9 +242,9 @@ class PipecatProvider(ConversationProvider):
         self.gradio_mode = gradio_mode
         self.instance_path = instance_path
 
-        # Queues bridging fastrtc ↔ pipecat
-        self._audio_in_queue: asyncio.Queue[Tuple[int, NDArray[np.int16]]] = asyncio.Queue()
-        self.output_queue: asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs] = asyncio.Queue()
+        # Queues bridging fastrtc ↔ pipecat (bounded to prevent OOM on RPi 4)
+        self._audio_in_queue: asyncio.Queue[Tuple[int, NDArray[np.int16]]] = asyncio.Queue(maxsize=100)
+        self.output_queue: asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs] = asyncio.Queue(maxsize=100)
 
         # Lifecycle
         self._pipeline_task: Any | None = None
@@ -252,9 +252,17 @@ class PipecatProvider(ConversationProvider):
         self._source: Any | None = None
         self.last_activity_time: float = 0.0
         self.start_time: float = 0.0
-        self._barge_in: bool = False
-        self._barge_in_time: float = 0.0
         self._last_emit_time: float = 0.0
+
+        # Barge-in: generation counter prevents stale clears from racing
+        self._barge_in_active: bool = False
+        self._barge_in_generation: int = 0
+
+        # Health tracking
+        self._frames_dropped: int = 0
+        self._last_stt_time: float = 0.0
+        self._last_llm_time: float = 0.0
+        self._last_tts_time: float = 0.0
 
     # ------------------------------------------------------------------
     # ConversationProvider abstract methods
@@ -325,7 +333,12 @@ class PipecatProvider(ConversationProvider):
             audio = resample(audio, n_samples).astype(np.int16)
 
         logger.debug("receive: sr=%d dtype=%s samples=%d", PIPELINE_SAMPLE_RATE, audio.dtype, len(audio))
-        await self._audio_in_queue.put((PIPELINE_SAMPLE_RATE, audio))
+        try:
+            self._audio_in_queue.put_nowait((PIPELINE_SAMPLE_RATE, audio))
+        except asyncio.QueueFull:
+            self._frames_dropped += 1
+            if self._frames_dropped % 50 == 1:
+                logger.warning("Audio input queue full, dropping frame (total dropped: %d)", self._frames_dropped)
 
     def copy(self) -> "PipecatProvider":
         """Return a new handler for a new WebRTC session."""
@@ -343,12 +356,7 @@ class PipecatProvider(ConversationProvider):
         clear a stuck _barge_in flag and check idle state.
         """
         while True:
-            # Safety: if _barge_in has been stuck for >3s, force-clear it.
             now = asyncio.get_event_loop().time()
-            if self._barge_in:
-                if now - self._barge_in_time > 3.0:
-                    logger.warning("_barge_in stuck for >3s, force-clearing")
-                    self._barge_in = False
 
             idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
             if idle_duration > 15.0 and self.deps.movement_manager.is_idle():
@@ -366,7 +374,7 @@ class PipecatProvider(ConversationProvider):
                 if silence_gap > 30.0:
                     logger.warning(
                         "Emit watchdog: no output for %.0fs (barge_in=%s)",
-                        silence_gap, self._barge_in,
+                        silence_gap, self._barge_in_active,
                     )
                     self._last_emit_time = now  # reset so we don't spam
 
@@ -515,9 +523,12 @@ class PipecatProvider(ConversationProvider):
             await params.result_callback(json.dumps(result))
 
             # Notify UI about tool usage
-            await provider_ref_for_tools.output_queue.put(
-                AdditionalOutputs({"role": "assistant", "content": f"Tool {fn_name}: {result}"})
-            )
+            try:
+                provider_ref_for_tools.output_queue.put_nowait(
+                    AdditionalOutputs({"role": "assistant", "content": f"Tool {fn_name}: {result}"})
+                )
+            except asyncio.QueueFull:
+                pass  # UI notification drop is acceptable
 
         # Register catch-all (function_name=None handles all tool calls)
         llm.register_function(None, _handle_tool_call)
@@ -840,12 +851,16 @@ class PipecatProvider(ConversationProvider):
                 if isinstance(frame, TTSTextFrame):
                     text = getattr(frame, "text", "")
                     if text:
+                        provider_ref._last_llm_time = asyncio.get_event_loop().time()
                         text = await self._intercept_tool_text(text)
                         frame.text = text
                         if text.strip():
-                            await provider_ref.output_queue.put(
-                                AdditionalOutputs({"role": "assistant", "content": text})
-                            )
+                            try:
+                                provider_ref.output_queue.put_nowait(
+                                    AdditionalOutputs({"role": "assistant", "content": text})
+                                )
+                            except asyncio.QueueFull:
+                                pass  # transcript drop is acceptable
                 await self.push_frame(frame, direction)
 
             async def _intercept_tool_text(self, text: str) -> str:
@@ -881,7 +896,7 @@ class PipecatProvider(ConversationProvider):
                 if isinstance(frame, (OutputAudioRawFrame, TTSAudioRawFrame)):
                     # During barge-in, drop TTS audio — the user is speaking
                     # and pipecat's InterruptionFrame hasn't fully propagated yet.
-                    if provider_ref._barge_in:
+                    if provider_ref._barge_in_active:
                         await self.push_frame(frame, direction)
                         return
 
@@ -919,33 +934,45 @@ class PipecatProvider(ConversationProvider):
                         b64 = base64.b64encode(pcm.tobytes()).decode("utf-8")
                         provider_ref.deps.head_wobbler.feed(b64)
 
-                    await provider_ref.output_queue.put((FASTRTC_SAMPLE_RATE, pcm.reshape(1, -1)))
+                    try:
+                        provider_ref.output_queue.put_nowait((FASTRTC_SAMPLE_RATE, pcm.reshape(1, -1)))
+                        provider_ref._last_tts_time = asyncio.get_event_loop().time()
+                    except asyncio.QueueFull:
+                        provider_ref._frames_dropped += 1
+                        if provider_ref._frames_dropped % 50 == 1:
+                            logger.warning("Output queue full, dropping TTS frame (total dropped: %d)", provider_ref._frames_dropped)
 
                 # Final user transcript
                 elif isinstance(frame, TranscriptionFrame):
-                    # Always clear barge-in on transcript — ensures the
-                    # flag is reset even if VADUserStoppedSpeakingFrame
-                    # was swallowed by an interruption broadcast.
-                    provider_ref._barge_in = False
+                    # Clear barge-in on transcript — ensures the flag is
+                    # reset even if VADUserStoppedSpeakingFrame was lost.
+                    provider_ref._barge_in_active = False
+                    provider_ref._last_stt_time = asyncio.get_event_loop().time()
                     text = getattr(frame, "text", "")
                     if text:
                         logger.debug("User transcript: %s", text)
-                        await provider_ref.output_queue.put(AdditionalOutputs({"role": "user", "content": text}))
+                        try:
+                            provider_ref.output_queue.put_nowait(AdditionalOutputs({"role": "user", "content": text}))
+                        except asyncio.QueueFull:
+                            pass
 
                 # Partial user transcript
                 elif isinstance(frame, InterimTranscriptionFrame):
                     text = getattr(frame, "text", "")
                     if text:
-                        await provider_ref.output_queue.put(
-                            AdditionalOutputs({"role": "user_partial", "content": text})
-                        )
+                        try:
+                            provider_ref.output_queue.put_nowait(
+                                AdditionalOutputs({"role": "user_partial", "content": text})
+                            )
+                        except asyncio.QueueFull:
+                            pass
 
                 # VAD speech boundaries → listening mode for movement manager.
                 # The robot should always be listening when idle — only
                 # TTS playback (above) temporarily clears the flag.
                 elif isinstance(frame, VADUserStartedSpeakingFrame):
-                    provider_ref._barge_in = True
-                    provider_ref._barge_in_time = asyncio.get_event_loop().time()
+                    provider_ref._barge_in_generation += 1
+                    provider_ref._barge_in_active = True
                     provider_ref.deps.movement_manager.set_listening(True)
                     if provider_ref.deps.head_wobbler is not None:
                         provider_ref.deps.head_wobbler.reset()
@@ -977,7 +1004,7 @@ class PipecatProvider(ConversationProvider):
 
                 elif isinstance(frame, VADUserStoppedSpeakingFrame):
                     # Clear barge-in flag so next LLM response audio plays
-                    provider_ref._barge_in = False
+                    provider_ref._barge_in_active = False
                     # Stay in listening mode — robot remains attentive
                     # between utterances.  Listening is only cleared
                     # while TTS audio is actively playing.
@@ -1186,6 +1213,25 @@ class PipecatProvider(ConversationProvider):
                 break
 
         logger.info("PipecatProvider: shutdown complete")
+
+    # ------------------------------------------------------------------
+    # Health
+    # ------------------------------------------------------------------
+
+    def get_pipeline_health(self) -> dict:
+        """Return pipeline health metrics for the dashboard."""
+        import time as _time
+
+        now = _time.monotonic()
+        return {
+            "last_stt_s_ago": round(now - self._last_stt_time, 1) if self._last_stt_time else None,
+            "last_llm_s_ago": round(now - self._last_llm_time, 1) if self._last_llm_time else None,
+            "last_tts_s_ago": round(now - self._last_tts_time, 1) if self._last_tts_time else None,
+            "frames_dropped": self._frames_dropped,
+            "barge_in_active": self._barge_in_active,
+            "barge_in_generation": self._barge_in_generation,
+            "pipeline_alive": self._pipeline_task is not None,
+        }
 
     # ------------------------------------------------------------------
     # Idle behaviour

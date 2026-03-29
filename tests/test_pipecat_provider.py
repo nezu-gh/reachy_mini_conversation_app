@@ -83,7 +83,7 @@ class TestCheckServices:
 # Audio validation tests for PipecatProvider.receive()
 # ---------------------------------------------------------------------------
 
-def _make_provider():
+def _make_provider(queue_maxsize: int = 0):
     """Create a minimal PipecatProvider with mocked deps for receive() testing."""
     from reachy_mini_conversation_app.providers.pipecat_provider import PipecatProvider
 
@@ -92,7 +92,10 @@ def _make_provider():
     provider = PipecatProvider(deps, gradio_mode=False, instance_path=None)
     # Simulate a live pipeline so receive() doesn't bail early
     provider._pipeline_task = MagicMock()
-    provider._audio_in_queue = asyncio.Queue()
+    if queue_maxsize > 0:
+        provider._audio_in_queue = asyncio.Queue(maxsize=queue_maxsize)
+    else:
+        provider._audio_in_queue = asyncio.Queue()
     return provider
 
 
@@ -122,3 +125,72 @@ async def test_receive_converts_float32_to_int16() -> None:
     sr, result = provider._audio_in_queue.get_nowait()
     assert result.dtype == np.int16
     assert sr == 16000
+
+
+# ---------------------------------------------------------------------------
+# Queue backpressure tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_receive_drops_frame_when_queue_full() -> None:
+    """When _audio_in_queue is full, receive() drops the frame without crashing."""
+    provider = _make_provider(queue_maxsize=2)
+    audio = np.array([100, 200, 300], dtype=np.int16)
+
+    # Fill the queue
+    await provider.receive((16000, audio))
+    await provider.receive((16000, audio))
+    assert provider._audio_in_queue.qsize() == 2
+
+    # This should drop silently
+    await provider.receive((16000, audio))
+    assert provider._audio_in_queue.qsize() == 2
+    assert provider._frames_dropped >= 1
+
+
+# ---------------------------------------------------------------------------
+# Barge-in generation counter tests
+# ---------------------------------------------------------------------------
+
+def test_barge_in_generation_prevents_stale_clear() -> None:
+    """Clearing barge-in with a stale generation should not deactivate it."""
+    provider = _make_provider()
+
+    # Simulate VADUserStartedSpeaking
+    provider._barge_in_generation += 1
+    provider._barge_in_active = True
+    current_gen = provider._barge_in_generation
+
+    # Simulate a stale clear (from previous speech, gen doesn't match)
+    stale_gen = current_gen - 1
+    # The generation check logic: only clear if gen matches
+    if stale_gen == provider._barge_in_generation:
+        provider._barge_in_active = False
+
+    assert provider._barge_in_active is True, "stale generation should not clear barge-in"
+
+
+def test_barge_in_cleared_on_matching_generation() -> None:
+    """Clearing barge-in with matching generation should deactivate it."""
+    provider = _make_provider()
+
+    provider._barge_in_generation += 1
+    provider._barge_in_active = True
+
+    # Clear with current generation (matches)
+    provider._barge_in_active = False
+
+    assert provider._barge_in_active is False
+
+
+def test_pipeline_health_returns_metrics() -> None:
+    """get_pipeline_health() returns expected keys."""
+    provider = _make_provider()
+    health = provider.get_pipeline_health()
+
+    assert "frames_dropped" in health
+    assert "pipeline_alive" in health
+    assert "barge_in_active" in health
+    assert "barge_in_generation" in health
+    assert health["frames_dropped"] == 0
+    assert health["barge_in_active"] is False

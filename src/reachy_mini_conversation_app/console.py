@@ -531,7 +531,7 @@ class LocalStream:
 
                 elif isinstance(handler_output, tuple):
                     # Skip audio that was queued before barge-in
-                    if getattr(self.handler, "_barge_in", False):
+                    if getattr(self.handler, "_barge_in_active", False):
                         continue
                     input_sample_rate, audio_data = handler_output
 
@@ -560,7 +560,7 @@ class LocalStream:
                         audio_frame = resample(audio_frame, num_samples)
 
                     # Double-check barge-in right before pushing to speaker
-                    if getattr(self.handler, "_barge_in", False):
+                    if getattr(self.handler, "_barge_in_active", False):
                         continue
                     await asyncio.to_thread(
                         self._robot.media.push_audio_sample, audio_frame,
