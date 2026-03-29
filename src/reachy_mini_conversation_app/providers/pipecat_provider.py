@@ -139,9 +139,10 @@ class PipecatProvider(ConversationProvider):
     # ------------------------------------------------------------------
 
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
-        """Accept an audio frame from fastrtc and forward into the pipeline.
+        """Accept an audio frame from fastrtc or LocalStream and forward into the pipeline.
 
-        Resamples from fastrtc's 24 kHz to the pipeline's 16 kHz.
+        Handles both int16 (fastrtc/Gradio) and float32 (LocalStream/robot mic)
+        input formats.  Resamples to the pipeline's 16 kHz if needed.
         """
         if self._pipeline_task is None:
             return
@@ -154,6 +155,10 @@ class PipecatProvider(ConversationProvider):
                 audio = audio.T
             if audio.shape[1] > 1:
                 audio = audio[:, 0]
+
+        # Convert float32 [-1.0, 1.0] → int16 [-32768, 32767]
+        if audio.dtype == np.float32 or audio.dtype == np.float64:
+            audio = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
 
         # Resample to pipeline rate
         if input_sr != PIPELINE_SAMPLE_RATE:
@@ -358,7 +363,13 @@ class PipecatProvider(ConversationProvider):
                     except asyncio.TimeoutError:
                         continue
 
-                    audio_bytes = audio.astype(np.int16).tobytes()
+                    # Audio is already int16 after receive() conversion
+                    if audio.dtype != np.int16:
+                        if audio.dtype in (np.float32, np.float64):
+                            audio = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+                        else:
+                            audio = audio.astype(np.int16)
+                    audio_bytes = audio.tobytes()
                     frame = InputAudioRawFrame(
                         audio=audio_bytes,
                         sample_rate=sr,
