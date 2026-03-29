@@ -20,6 +20,7 @@ before it reaches the output queue.
 from __future__ import annotations
 import os
 import re
+import json
 import base64
 import asyncio
 import logging
@@ -111,6 +112,7 @@ class PipecatProvider(ConversationProvider):
         self._source: Any | None = None
         self.last_activity_time: float = 0.0
         self.start_time: float = 0.0
+        self._barge_in: bool = False
 
     # ------------------------------------------------------------------
     # ConversationProvider abstract methods
@@ -183,17 +185,33 @@ class PipecatProvider(ConversationProvider):
         """Emit audio / transcript frames to fastrtc.
 
         Also fires idle signals when the robot has been quiet too long.
+        Uses a short timeout on queue.get() so we can periodically
+        clear a stuck _barge_in flag and check idle state.
         """
-        idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
-        if idle_duration > 15.0 and self.deps.movement_manager.is_idle():
-            try:
-                await self.send_idle_signal(idle_duration)
-            except Exception as exc:
-                logger.warning("Idle signal skipped: %s", exc)
-                return None
-            self.last_activity_time = asyncio.get_event_loop().time()
+        while True:
+            # Safety: if _barge_in has been stuck for >3s, force-clear it.
+            if self._barge_in:
+                if not hasattr(self, "_barge_in_time"):
+                    self._barge_in_time = asyncio.get_event_loop().time()
+                elif asyncio.get_event_loop().time() - self._barge_in_time > 3.0:
+                    logger.warning("_barge_in stuck for >3s, force-clearing")
+                    self._barge_in = False
+            if not self._barge_in and hasattr(self, "_barge_in_time"):
+                del self._barge_in_time
 
-        return await wait_for_item(self.output_queue)  # type: ignore[no-any-return]
+            idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
+            if idle_duration > 15.0 and self.deps.movement_manager.is_idle():
+                try:
+                    await self.send_idle_signal(idle_duration)
+                except Exception as exc:
+                    logger.warning("Idle signal skipped: %s", exc)
+                    return None
+                self.last_activity_time = asyncio.get_event_loop().time()
+
+            try:
+                return await asyncio.wait_for(self.output_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue  # loop back to check _barge_in / idle
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -314,14 +332,16 @@ class PipecatProvider(ConversationProvider):
         async def _handle_tool_call(params) -> None:
             """Catch-all handler for all pipecat function calls."""
             fn_name = params.function_name
-            args_json = params.arguments
+            arguments = params.arguments
             tool_call_id = params.tool_call_id
 
-            logger.info("Tool call: %s(%s) [%s]", fn_name, args_json, tool_call_id)
+            logger.info("Tool call: %s(%s) [%s]", fn_name, arguments, tool_call_id)
 
+            # pipecat passes arguments as a dict (Mapping), but
+            # dispatch_tool_call expects a JSON string.
+            args_json = json.dumps(arguments) if isinstance(arguments, dict) else str(arguments)
             result = await dispatch_tool_call(fn_name, args_json, provider_ref_for_tools.deps)
 
-            import json
             await params.result_callback(json.dumps(result))
 
             # Notify UI about tool usage
@@ -358,10 +378,11 @@ class PipecatProvider(ConversationProvider):
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
                 """Forward frames that arrive from upstream."""
-                await self.push_frame(frame, direction)
+                await super().process_frame(frame, direction)
 
             async def run(self, task: PipelineTask) -> None:
                 """Background loop that feeds mic audio into the pipeline."""
+                _src_count = 0
                 while self._running:
                     try:
                         sr, audio = await asyncio.wait_for(provider_ref._audio_in_queue.get(), timeout=0.5)
@@ -393,6 +414,7 @@ class PipecatProvider(ConversationProvider):
             """
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                await super().process_frame(frame, direction)
                 if isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
                     text = getattr(frame, "text", "")
                     cleaned = text.replace("<asr_text>", "").strip()
@@ -431,6 +453,7 @@ class PipecatProvider(ConversationProvider):
                 self._multimodal = multimodal
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                await super().process_frame(frame, direction)
                 if not isinstance(frame, LLMContextFrame):
                     await self.push_frame(frame, direction)
                     return
@@ -553,6 +576,7 @@ class PipecatProvider(ConversationProvider):
                 self._max_chars = max_chars
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                await super().process_frame(frame, direction)
                 if not isinstance(frame, TTSTextFrame):
                     await self.push_frame(frame, direction)
                     return
@@ -610,36 +634,121 @@ class PipecatProvider(ConversationProvider):
                                 return m.end()
                 return None
 
+        # Regex to catch tool calls written as plain text by the LLM
+        # (e.g. "micro_expression(happy)" or "play_emotion(joy)")
+        _TOOL_TEXT_RE = re.compile(
+            r'(micro_expression|play_emotion|move_head|dance|stop_dance|stop_emotion|do_nothing)'
+            r'\(([^)]*)\)',
+        )
+        # Also catch markdown-style expressions the LLM sometimes writes
+        # e.g. "*Micro-expression: laugh*" or "*micro-expression: happy*"
+        _MARKDOWN_EXPR_RE = re.compile(
+            r'\*[Mm]icro[- ]expression:\s*(\w+)\*',
+        )
+
         class AssistantTextTap(FrameProcessor):
             """Taps LLM output text before it reaches TTS.
+
+            Intercepts tool-call-like text (e.g. ``micro_expression(happy)``)
+            that the LLM wrote as content instead of a proper tool call,
+            dispatches them, and strips them from the TTS text.
 
             Emits an AdditionalOutputs with role=assistant so the Gradio
             chatbot (or LocalStream logger) can display what the bot said.
             """
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                await super().process_frame(frame, direction)
                 if isinstance(frame, TTSTextFrame):
                     text = getattr(frame, "text", "")
                     if text:
-                        await provider_ref.output_queue.put(AdditionalOutputs({"role": "assistant", "content": text}))
+                        # Extract and dispatch inlined tool calls
+                        text = await self._intercept_tool_text(text)
+                        frame.text = text
+                        if text.strip():
+                            await provider_ref.output_queue.put(
+                                AdditionalOutputs({"role": "assistant", "content": text})
+                            )
+                        else:
+                            # Pure tool-call text, nothing left for TTS
+                            return
                 await self.push_frame(frame, direction)
+
+            async def _intercept_tool_text(self, text: str) -> str:
+                """Find tool-call patterns in text, dispatch them, return cleaned text."""
+                found_any = False
+
+                # Pattern 1: micro_expression(happy) style
+                for m in _TOOL_TEXT_RE.finditer(text):
+                    found_any = True
+                    fn_name = m.group(1)
+                    raw_arg = m.group(2).strip().strip("'\"")
+                    if fn_name == "micro_expression":
+                        args_json = json.dumps({"expression": raw_arg})
+                    elif fn_name == "play_emotion":
+                        args_json = json.dumps({"emotion_name": raw_arg})
+                    elif fn_name == "move_head":
+                        args_json = json.dumps({"direction": raw_arg})
+                    elif fn_name == "dance":
+                        args_json = json.dumps({"move_name": raw_arg} if raw_arg else {})
+                    else:
+                        args_json = json.dumps({})
+                    logger.info("Intercepted text tool call: %s(%s)", fn_name, raw_arg)
+                    try:
+                        await dispatch_tool_call(fn_name, args_json, provider_ref.deps)
+                    except Exception as exc:
+                        logger.warning("Intercepted tool call %s failed: %s", fn_name, exc)
+
+                # Pattern 2: *Micro-expression: laugh* style
+                for m in _MARKDOWN_EXPR_RE.finditer(text):
+                    found_any = True
+                    expr = m.group(1).lower()
+                    logger.info("Intercepted markdown expression: %s", expr)
+                    try:
+                        await dispatch_tool_call(
+                            "micro_expression",
+                            json.dumps({"expression": expr}),
+                            provider_ref.deps,
+                        )
+                    except Exception as exc:
+                        logger.warning("Markdown expression %s failed: %s", expr, exc)
+
+                if not found_any:
+                    return text
+
+                # Strip both patterns from the text
+                cleaned = _TOOL_TEXT_RE.sub("", text)
+                cleaned = _MARKDOWN_EXPR_RE.sub("", cleaned).strip()
+                return cleaned
 
         class PipelineSink(FrameProcessor):
             """Intercepts output frames and bridges them to fastrtc."""
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                # Let base class handle lifecycle (StartFrame → __start, etc.)
+                await super().process_frame(frame, direction)
+
                 # TTS audio → output queue + head wobbler
                 # While the robot is speaking, suppress listening so
                 # idle breathing is allowed and antennas aren't frozen.
                 if isinstance(frame, (OutputAudioRawFrame, TTSAudioRawFrame)):
+                    # During barge-in, drop TTS audio — the user is speaking
+                    # and pipecat's InterruptionFrame hasn't fully propagated yet.
+                    if provider_ref._barge_in:
+                        await self.push_frame(frame, direction)
+                        return
+
                     audio_bytes = frame.audio
                     sr = frame.sample_rate
 
                     provider_ref.deps.movement_manager.set_listening(False)
                     provider_ref.last_activity_time = asyncio.get_event_loop().time()
 
-                    # Convert raw PCM bytes → int16 numpy
-                    pcm = np.frombuffer(audio_bytes, dtype=np.int16)
+                    # Convert raw PCM bytes → int16 numpy and boost volume.
+                    # Qwen3-TTS outputs at ~7% RMS — apply gain to fill
+                    # the dynamic range without clipping.  (2.8x ≈ 70% of 4x)
+                    pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.int32)
+                    pcm = np.clip(pcm * 2.8, -32768, 32767).astype(np.int16)
 
                     # Resample to fastrtc 24 kHz if needed (TTS should
                     # already output 24 kHz, but handle mismatches).
@@ -657,6 +766,10 @@ class PipecatProvider(ConversationProvider):
 
                 # Final user transcript
                 elif isinstance(frame, TranscriptionFrame):
+                    # Always clear barge-in on transcript — ensures the
+                    # flag is reset even if VADUserStoppedSpeakingFrame
+                    # was swallowed by an interruption broadcast.
+                    provider_ref._barge_in = False
                     text = getattr(frame, "text", "")
                     if text:
                         logger.debug("User transcript: %s", text)
@@ -674,6 +787,7 @@ class PipecatProvider(ConversationProvider):
                 # The robot should always be listening when idle — only
                 # TTS playback (above) temporarily clears the flag.
                 elif isinstance(frame, VADUserStartedSpeakingFrame):
+                    provider_ref._barge_in = True
                     provider_ref.deps.movement_manager.set_listening(True)
                     if provider_ref.deps.head_wobbler is not None:
                         provider_ref.deps.head_wobbler.reset()
@@ -691,17 +805,27 @@ class PipecatProvider(ConversationProvider):
                             break
                     for item in kept:
                         await provider_ref.output_queue.put(item)
-                    logger.debug("User speech started (barge-in, drained audio)")
+                    # Also flush the robot's GStreamer player buffer so
+                    # already-pushed audio stops immediately.
+                    clear_fn = getattr(provider_ref, "_clear_queue", None)
+                    if clear_fn is not None:
+                        try:
+                            clear_fn()
+                        except Exception as exc:
+                            logger.debug("clear_queue during barge-in: %s", exc)
+                    logger.debug("User speech started (barge-in, drained audio + player)")
 
                 elif isinstance(frame, VADUserStoppedSpeakingFrame):
+                    # Clear barge-in flag so next LLM response audio plays
+                    provider_ref._barge_in = False
                     # Stay in listening mode — robot remains attentive
                     # between utterances.  Listening is only cleared
                     # while TTS audio is actively playing.
                     provider_ref.deps.movement_manager.set_listening(True)
                     logger.debug("User speech stopped (still listening)")
 
-                # Always forward the frame so downstream processors
-                # (like assistant_aggregator) still see it.
+                # Always forward so downstream processors
+                # (like assistant_aggregator) still see the frame.
                 await self.push_frame(frame, direction)
 
         # ---- Assemble pipeline -------------------------------------------

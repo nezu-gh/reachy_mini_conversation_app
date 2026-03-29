@@ -63,10 +63,11 @@ class Camera(Tool):
                 else {"error": "vision returned non-string"}
             )
 
-        # Encode image directly to JPEG bytes without writing to file
-        success, buffer = cv2.imencode('.jpg', frame)
-        if not success:
-            raise RuntimeError("Failed to encode frame as JPEG")
-
-        b64_encoded = base64.b64encode(buffer.tobytes()).decode("utf-8")
-        return {"b64_im": b64_encoded}
+        # No vision processor available — return an error instead of
+        # dumping a raw base64 image into the text-only LLM context.
+        logger.warning("camera: no vision processor, cannot analyse image")
+        return {
+            "error": "Vision is not available. I took a picture but I cannot "
+                     "analyse it because no vision model is configured. "
+                     "Tell the user you cannot see right now."
+        }

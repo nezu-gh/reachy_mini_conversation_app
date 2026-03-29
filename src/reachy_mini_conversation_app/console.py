@@ -458,7 +458,9 @@ class LocalStream:
                 audio.clear_output_buffer()
             elif hasattr(audio, "clear_player") and callable(audio.clear_player):
                 audio.clear_player()
-        self.handler.output_queue = asyncio.Queue()
+        # Don't replace output_queue — play_loop/emit() holds a reference
+        # to the old queue and would get stuck.  PipelineSink already
+        # drains the queue and the _barge_in flag blocks new audio.
 
     async def record_loop(self) -> None:
         """Read mic frames from the recorder and forward them to the handler."""
@@ -487,6 +489,9 @@ class LocalStream:
                         )
 
             elif isinstance(handler_output, tuple):
+                # Skip audio that was queued before barge-in
+                if getattr(self.handler, "_barge_in", False):
+                    continue
                 input_sample_rate, audio_data = handler_output
                 output_sample_rate = self._robot.media.get_output_audio_samplerate()
 
@@ -509,6 +514,9 @@ class LocalStream:
                         int(len(audio_frame) * output_sample_rate / input_sample_rate),
                     )
 
+                # Double-check barge-in right before pushing to speaker
+                if getattr(self.handler, "_barge_in", False):
+                    continue
                 self._robot.media.push_audio_sample(audio_frame)
 
             else:
