@@ -1500,7 +1500,7 @@ class PipecatProvider(ConversationProvider):
 
         # Detect multimodal LLM by model name patterns or env var override.
         # LLM_MULTIMODAL=0/false/no explicitly disables; =1/true/yes forces on.
-        _multimodal_patterns = ("vlm", "vl-", "vision", "llava", "smolvlm", "qwen3.5")
+        _multimodal_patterns = ("vlm", "vl-", "vision", "llava", "smolvlm")
         _multimodal_env = os.environ.get("LLM_MULTIMODAL", "").lower()
         if _multimodal_env in ("0", "false", "no"):
             _is_multimodal = False
