@@ -73,7 +73,13 @@ def run(
         try:
             robot_kwargs = {}
             if args.robot_name is not None:
-                robot_kwargs["robot_name"] = args.robot_name
+                robot_kwargs["host"] = args.robot_name
+                robot_kwargs["connection_mode"] = "network"
+
+            # When using the pipecat provider, audio is handled by our own
+            # pipeline — skip GStreamer media to avoid the Gst dependency.
+            if getattr(args, "provider", "openai") == "pipecat":
+                robot_kwargs["media_backend"] = "no_media"
 
             logger.info("Initializing ReachyMini (SDK will auto-detect appropriate backend)")
             robot = ReachyMini(**robot_kwargs)
@@ -243,6 +249,22 @@ class ReachyMiniConversationApp(ReachyMiniApp):  # type: ignore[misc]
     custom_app_url = "http://0.0.0.0:7860/"
     dont_start_webserver = False
 
+    def __init__(self, **kwargs: Any) -> None:
+        args, _ = parse_args()
+        # When using the pipecat provider, audio is handled by our own
+        # pipeline — skip GStreamer media to avoid the Gst dependency.
+        if getattr(args, "provider", "openai") == "pipecat":
+            self.request_media_backend = "no_media"
+        # When --robot-name is set, the robot is remote — force network mode
+        # even if something else is listening on localhost:8000.
+        if args.robot_name is not None:
+            self._force_network = True
+        else:
+            self._force_network = False
+        super().__init__(**kwargs)
+        if self._force_network:
+            self.daemon_on_localhost = False
+
     def run(self, reachy_mini: ReachyMini, stop_event: threading.Event) -> None:
         """Run the Reachy Mini conversation app."""
         loop = asyncio.new_event_loop()
@@ -265,7 +287,12 @@ class ReachyMiniConversationApp(ReachyMiniApp):  # type: ignore[misc]
 
 if __name__ == "__main__":
     app = ReachyMiniConversationApp()
+    # Pass robot host from --robot-name / REACHY_ROBOT_NAME env var
+    _args, _ = parse_args()
+    _robot_kwargs: Dict[str, Any] = {}
+    if _args.robot_name is not None:
+        _robot_kwargs["host"] = _args.robot_name
     try:
-        app.wrapped_run()
+        app.wrapped_run(**_robot_kwargs)
     except KeyboardInterrupt:
         app.stop()

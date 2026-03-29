@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import sys
 import logging
 import argparse
@@ -39,8 +40,8 @@ def parse_args() -> tuple[argparse.Namespace, list]:  # type: ignore
     parser.add_argument(
         "--robot-name",
         type=str,
-        default=None,
-        help="[Optional] Robot name to target. Must match the daemon's --robot-name when connecting to a specific robot, mainly useful for development with multiple robots.",
+        default=os.environ.get("REACHY_ROBOT_NAME"),
+        help="[Optional] Robot host/IP to target. Falls back to REACHY_ROBOT_NAME env var.",
     )
     parser.add_argument(
         "--provider",
