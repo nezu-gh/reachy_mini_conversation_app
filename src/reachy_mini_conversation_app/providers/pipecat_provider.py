@@ -390,7 +390,7 @@ class PipecatProvider(ConversationProvider):
         if PipecatProvider._receive_count <= 3 or PipecatProvider._receive_count % 500 == 0:
             try:
                 with open("/tmp/diag.log", "a") as _df:
-                    _df.write(f"[DIAG] receive #{PipecatProvider._receive_count} pipeline_task={'SET' if self._pipeline_task else 'NONE'}\n")
+                    _df.write(f"[DIAG] receive #{PipecatProvider._receive_count} pipeline_task={'SET' if self._pipeline_task else 'NONE'} queue_id={id(self._audio_in_queue)} qsize={self._audio_in_queue.qsize()}\n")
                     _df.flush()
             except Exception:
                 pass
@@ -689,10 +689,11 @@ class PipecatProvider(ConversationProvider):
             async def run(self, task: PipelineTask) -> None:
                 """Background loop that feeds mic audio into the pipeline."""
                 _src_count = 0
+                _timeout_count = 0
                 logger.info("PipelineSource.run: started, waiting for audio frames")
                 try:
                     with open("/tmp/diag.log", "a") as _df:
-                        _df.write("[DIAG] PipelineSource.run started\n")
+                        _df.write(f"[DIAG] PipelineSource.run started, queue_id={id(provider_ref._audio_in_queue)}, qsize={provider_ref._audio_in_queue.qsize()}\n")
                         _df.flush()
                 except Exception:
                     pass
@@ -700,8 +701,14 @@ class PipecatProvider(ConversationProvider):
                     try:
                         sr, audio = await asyncio.wait_for(provider_ref._audio_in_queue.get(), timeout=0.5)
                     except asyncio.TimeoutError:
-                        if _src_count == 0:
-                            logger.debug("PipelineSource.run: no audio yet (queue empty)")
+                        _timeout_count += 1
+                        if _timeout_count <= 5 or _timeout_count % 100 == 0:
+                            try:
+                                with open("/tmp/diag.log", "a") as _df:
+                                    _df.write(f"[DIAG] PipelineSource timeout #{_timeout_count}, qsize={provider_ref._audio_in_queue.qsize()}, running={self._running}\n")
+                                    _df.flush()
+                            except Exception:
+                                pass
                         continue
 
                     # Audio is already int16 after receive() conversion
