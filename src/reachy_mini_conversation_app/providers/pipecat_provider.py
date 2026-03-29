@@ -539,10 +539,11 @@ class PipecatProvider(ConversationProvider):
                 # Disable thinking via chat_template_kwargs so the Jinja
                 # template pre-fills an empty <think>\n\n</think> block.
                 # This avoids the 30-90s thinking latency on Qwen3.5.
+                # Note: put directly in extra (not nested under extra_body)
+                # because ik-llama.cpp needs it at the top level of the
+                # request body, and pipecat merges extra directly into params.
                 extra={
-                    "extra_body": {
-                        "chat_template_kwargs": {"enable_thinking": False},
-                    },
+                    "chat_template_kwargs": {"enable_thinking": False},
                 },
             ),
         )
@@ -1615,9 +1616,7 @@ class PipecatProvider(ConversationProvider):
                     model=LLM_MODEL,
                     system_instruction=get_session_instructions(),
                     extra={
-                        "extra_body": {
-                            "chat_template_kwargs": {"enable_thinking": False},
-                        },
+                        "chat_template_kwargs": {"enable_thinking": False},
                     },
                 ),
             )
