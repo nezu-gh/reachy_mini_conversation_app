@@ -63,6 +63,9 @@ def run(
 
     logger = setup_logger(args.debug)
     logger.info("Starting Reachy Mini Conversation App")
+    with open("/tmp/diag.log", "a") as _df:
+        _df.write(f"[DIAG] run() entered, provider={getattr(args, 'provider', 'unknown')}\n")
+        _df.flush()
 
     if args.no_camera and args.head_tracker is not None:
         logger.warning(
