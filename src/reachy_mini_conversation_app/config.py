@@ -139,6 +139,12 @@ else:
     # Locate .env file (search upward from current working directory)
     dotenv_path = find_dotenv(usecwd=True)
 
+    # Fallback: check project root (needed when daemon launches from its own CWD)
+    if not dotenv_path:
+        candidate = PROJECT_ROOT / ".env"
+        if candidate.is_file():
+            dotenv_path = str(candidate)
+
     if dotenv_path:
         # Load .env and override environment variables
         load_dotenv(dotenv_path=dotenv_path, override=True)
