@@ -36,14 +36,22 @@ class Camera(Tool):
 
         logger.info("Tool call: camera question=%s", question[:120])
 
+        frame = None
         if deps.camera_worker is not None:
             frame = deps.camera_worker.get_latest_frame()
-            if frame is None:
-                logger.error("No frame available from camera worker")
-                return {"error": "No frame available"}
-        else:
-            logger.error("Camera worker not available")
-            return {"error": "Camera worker not available"}
+
+        # Fall back to subprocess-based capture when camera_worker has no frames
+        # (works around GStreamer Python threading issue with unixfdsrc)
+        if frame is None:
+            try:
+                from reachy_mini_conversation_app.camera_capture import capture_frame
+                frame = await asyncio.to_thread(capture_frame)
+            except Exception as e:
+                logger.warning("Subprocess camera capture failed: %s", e)
+
+        if frame is None:
+            logger.error("No frame available from any camera source")
+            return {"error": "No frame available"}
 
         if deps.vision_processor is not None:
             vision_result = await asyncio.to_thread(
