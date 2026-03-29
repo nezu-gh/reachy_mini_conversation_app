@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING, Optional
 from reachy_mini import ReachyMini
 from reachy_mini_conversation_app.camera_worker import CameraWorker
 
+# Import config early so .env is loaded before parse_args reads os.environ
+import reachy_mini_conversation_app.config  # noqa: F401
+
 
 if TYPE_CHECKING:
     from reachy_mini_conversation_app.vision.processors import VisionProcessor
