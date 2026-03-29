@@ -518,7 +518,11 @@ class PipecatProvider(ConversationProvider):
             # pipecat passes arguments as a dict (Mapping), but
             # dispatch_tool_call expects a JSON string.
             args_json = json.dumps(arguments) if isinstance(arguments, dict) else str(arguments)
-            result = await dispatch_tool_call(fn_name, args_json, provider_ref_for_tools.deps)
+            try:
+                result = await dispatch_tool_call(fn_name, args_json, provider_ref_for_tools.deps)
+            except Exception as exc:
+                logger.exception("Tool call %s failed", fn_name)
+                result = {"error": str(exc)}
 
             await params.result_callback(json.dumps(result))
 
@@ -931,8 +935,11 @@ class PipecatProvider(ConversationProvider):
                     # Feed HeadWobbler with 24 kHz PCM (same rate it
                     # expects from the OpenAI path).
                     if provider_ref.deps.head_wobbler is not None:
-                        b64 = base64.b64encode(pcm.tobytes()).decode("utf-8")
-                        provider_ref.deps.head_wobbler.feed(b64)
+                        try:
+                            b64 = base64.b64encode(pcm.tobytes()).decode("utf-8")
+                            provider_ref.deps.head_wobbler.feed(b64)
+                        except Exception as exc:
+                            logger.warning("HeadWobbler feed failed: %s", exc)
 
                     try:
                         provider_ref.output_queue.put_nowait((FASTRTC_SAMPLE_RATE, pcm.reshape(1, -1)))
@@ -991,7 +998,10 @@ class PipecatProvider(ConversationProvider):
                         except asyncio.QueueEmpty:
                             break
                     for item in kept:
-                        await provider_ref.output_queue.put(item)
+                        try:
+                            provider_ref.output_queue.put_nowait(item)
+                        except asyncio.QueueFull:
+                            pass  # acceptable during congestion
                     # Also flush the robot's GStreamer player buffer so
                     # already-pushed audio stops immediately.
                     clear_fn = getattr(provider_ref, "_clear_queue", None)
@@ -1100,7 +1110,12 @@ class PipecatProvider(ConversationProvider):
         max_attempts = 3
 
         def _build_pipeline():
-            """Rebuild all stateful pipeline components for a fresh attempt."""
+            """Rebuild all pipeline components for a fresh attempt.
+
+            Rebuilds services too — if a service has a corrupted internal
+            state or a dangling HTTP connection, reusing it would cause
+            the same crash on retry.
+            """
             _source = PipelineSource()
             _asr_cleaner = ASRTextCleaner()
             _vision_injector = VisionInjector(multimodal=_is_multimodal)
@@ -1111,9 +1126,38 @@ class PipecatProvider(ConversationProvider):
             _context = LLMContext(tools=openai_tools)
             _user_agg, _assistant_agg = LLMContextAggregatorPair(_context)
 
+            # Rebuild services to avoid reusing corrupted state
+            _stt = OpenAISTTService(
+                api_key="not-needed",
+                base_url=ASR_BASE_URL,
+                settings=OpenAISTTService.Settings(model=ASR_MODEL),
+            )
+            _llm = OpenAILLMService(
+                api_key="not-needed",
+                base_url=LLM_BASE_URL,
+                settings=OpenAILLMService.Settings(
+                    model=LLM_MODEL,
+                    system_instruction=get_session_instructions(),
+                    extra={
+                        "extra_body": {
+                            "chat_template_kwargs": {"enable_thinking": False},
+                        },
+                    },
+                ),
+            )
+            _llm.register_function(None, _handle_tool_call)
+            _tts = OpenAITTSService(
+                api_key="not-needed",
+                base_url=TTS_BASE_URL,
+                settings=OpenAITTSService.Settings(model=TTS_MODEL),
+            )
+            _vad = VADProcessor(
+                vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE),
+            )
+
             _pipeline = Pipeline([
-                vad, stt, _asr_cleaner, _user_agg, _context_trimmer,
-                _vision_injector, llm, _text_tap, _tts_chunker, tts,
+                _vad, _stt, _asr_cleaner, _user_agg, _context_trimmer,
+                _vision_injector, _llm, _text_tap, _tts_chunker, _tts,
                 _sink, _assistant_agg,
             ])
             _task = PipelineTask(
