@@ -493,19 +493,28 @@ class LocalStream:
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
 
+        _consecutive_errors = 0
         while not self._stop_event.is_set():
             try:
-                audio_frame = self._robot.media.get_audio_sample()
+                audio_frame = await asyncio.to_thread(
+                    self._robot.media.get_audio_sample,
+                )
                 if audio_frame is not None:
                     await self.handler.receive((input_sample_rate, audio_frame))
+                _consecutive_errors = 0
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("record_loop: error processing audio frame")
-            await asyncio.sleep(0)  # avoid busy loop
+                _consecutive_errors += 1
+                if _consecutive_errors <= 3:
+                    logger.exception("record_loop: error processing audio frame")
+                elif _consecutive_errors == 10:
+                    logger.error("record_loop: %d consecutive errors, audio input may be broken", _consecutive_errors)
+            await asyncio.sleep(0)
 
     async def play_loop(self) -> None:
         """Fetch outputs from the handler: log text and play audio frames."""
+        _consecutive_errors = 0
         while not self._stop_event.is_set():
             try:
                 handler_output = await self.handler.emit()
@@ -553,14 +562,22 @@ class LocalStream:
                     # Double-check barge-in right before pushing to speaker
                     if getattr(self.handler, "_barge_in", False):
                         continue
-                    self._robot.media.push_audio_sample(audio_frame)
+                    await asyncio.to_thread(
+                        self._robot.media.push_audio_sample, audio_frame,
+                    )
 
                 else:
                     logger.debug("Ignoring output type=%s", type(handler_output).__name__)
 
+                _consecutive_errors = 0
+
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("play_loop: error processing output frame")
+                _consecutive_errors += 1
+                if _consecutive_errors <= 3:
+                    logger.exception("play_loop: error processing output frame")
+                elif _consecutive_errors == 10:
+                    logger.error("play_loop: %d consecutive errors, audio output may be broken", _consecutive_errors)
 
             await asyncio.sleep(0)  # yield to event loop

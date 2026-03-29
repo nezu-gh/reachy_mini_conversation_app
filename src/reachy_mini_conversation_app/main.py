@@ -242,20 +242,37 @@ def run(
     except (KeyboardInterrupt, SystemExit):
         logger.info("Shutdown signal received, closing server.")
     finally:
-        # Each cleanup step is independent — one failure must not skip the rest
-        for label, action in [
-            ("movement_manager", movement_manager.stop),
-            ("head_wobbler", head_wobbler.stop),
-            ("camera_worker", lambda: camera_worker.stop() if camera_worker else None),
-            ("robot.goto_sleep", robot.goto_sleep),
-            ("robot.disable_motors", robot.disable_motors),
-            ("robot.media.close", robot.media.close),
-            ("robot.client.disconnect", robot.client.disconnect),
-        ]:
+        # Each cleanup step is independent — one failure must not skip the rest.
+        # Order matters: stop workers → sleep robot → close media → disconnect.
+        try:
+            movement_manager.stop()
+        except Exception as e:
+            logger.debug("Cleanup movement_manager failed: %s", e)
+        try:
+            head_wobbler.stop()
+        except Exception as e:
+            logger.debug("Cleanup head_wobbler failed: %s", e)
+        if camera_worker:
             try:
-                action()
+                camera_worker.stop()
             except Exception as e:
-                logger.debug("Cleanup %s failed: %s", label, e)
+                logger.debug("Cleanup camera_worker failed: %s", e)
+        try:
+            robot.goto_sleep()
+        except Exception as e:
+            logger.debug("Cleanup goto_sleep failed: %s", e)
+        try:
+            robot.disable_motors()
+        except Exception as e:
+            logger.debug("Cleanup disable_motors failed: %s", e)
+        try:
+            robot.media.close()
+        except Exception as e:
+            logger.debug("Cleanup media.close failed: %s", e)
+        try:
+            robot.client.disconnect()
+        except Exception as e:
+            logger.debug("Cleanup client.disconnect failed: %s", e)
         time.sleep(1)
         logger.info("Shutdown complete.")
 

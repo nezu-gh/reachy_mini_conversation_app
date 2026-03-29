@@ -1072,6 +1072,35 @@ class PipecatProvider(ConversationProvider):
         # Kick off the pipeline in a background asyncio task with retry
         max_attempts = 3
 
+        def _build_pipeline():
+            """Rebuild all stateful pipeline components for a fresh attempt."""
+            _source = PipelineSource()
+            _asr_cleaner = ASRTextCleaner()
+            _vision_injector = VisionInjector(multimodal=_is_multimodal)
+            _context_trimmer = ContextTrimmer()
+            _tts_chunker = TTSTextChunker(max_chars=150)
+            _text_tap = AssistantTextTap()
+            _sink = PipelineSink()
+            _context = LLMContext(tools=openai_tools)
+            _user_agg, _assistant_agg = LLMContextAggregatorPair(_context)
+
+            _pipeline = Pipeline([
+                vad, stt, _asr_cleaner, _user_agg, _context_trimmer,
+                _vision_injector, llm, _text_tap, _tts_chunker, tts,
+                _sink, _assistant_agg,
+            ])
+            _task = PipelineTask(
+                _pipeline,
+                params=PipelineParams(
+                    allow_interruptions=True,
+                    audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+                    audio_out_sample_rate=FASTRTC_SAMPLE_RATE,
+                    enable_metrics=True,
+                    enable_usage_metrics=True,
+                ),
+            )
+            return _source, _task
+
         async def _run() -> None:
             nonlocal task, source
             for attempt in range(1, max_attempts + 1):
@@ -1097,19 +1126,9 @@ class PipecatProvider(ConversationProvider):
                         delay = 2 ** (attempt - 1) + random.uniform(0, 0.5)
                         logger.info("Retrying pipeline in %.1fs...", delay)
                         await asyncio.sleep(delay)
-                        # Rebuild source and task for retry
-                        source = PipelineSource()
+                        # Rebuild entire pipeline with fresh stateful components
+                        source, task = _build_pipeline()
                         self._source = source
-                        task = PipelineTask(
-                            pipeline,
-                            params=PipelineParams(
-                                allow_interruptions=True,
-                                audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
-                                audio_out_sample_rate=FASTRTC_SAMPLE_RATE,
-                                enable_metrics=True,
-                                enable_usage_metrics=True,
-                            ),
-                        )
                         self._pipeline_task = task
                     else:
                         logger.error("Pipeline failed after %d attempts", max_attempts)
