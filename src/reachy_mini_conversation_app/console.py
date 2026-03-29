@@ -32,7 +32,7 @@ try:
     from pydantic import BaseModel
     from fastapi.responses import FileResponse, JSONResponse
     from starlette.staticfiles import StaticFiles
-except Exception:  # pragma: no cover - only loaded when settings_app is used
+except ImportError:  # pragma: no cover - only loaded when settings_app is used
     FastAPI = object  # type: ignore
     FileResponse = object  # type: ignore
     JSONResponse = object  # type: ignore
@@ -78,31 +78,31 @@ class LocalStream:
             if env_path.exists():
                 try:
                     return env_path.read_text(encoding="utf-8").splitlines()
-                except Exception:
+                except OSError:
                     return []
             template_text = None
             ex = inst / ".env.example"
             if ex.exists():
                 try:
                     template_text = ex.read_text(encoding="utf-8")
-                except Exception:
+                except OSError:
                     template_text = None
             if template_text is None:
                 try:
                     cwd_example = Path.cwd() / ".env.example"
                     if cwd_example.exists():
                         template_text = cwd_example.read_text(encoding="utf-8")
-                except Exception:
+                except OSError:
                     template_text = None
             if template_text is None:
                 packaged = Path(__file__).parent / ".env.example"
                 if packaged.exists():
                     try:
                         template_text = packaged.read_text(encoding="utf-8")
-                    except Exception:
+                    except OSError:
                         template_text = None
             return template_text.splitlines() if template_text else []
-        except Exception:
+        except OSError:
             return []
 
     def _persist_api_key(self, key: str) -> None:

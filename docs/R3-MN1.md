@@ -50,7 +50,9 @@ The upstream OpenAI Realtime API path is preserved as the default/fallback provi
               │    Pipecat Pipeline (16 kHz)     │
               │                                  │
               │  VAD → STT → ASRCleaner →        │
-              │  UserAgg → LLM → TextTap →       │
+              │  UserAgg(+SmartTurn) →            │
+              │  VisionInjector → LLM →           │
+              │  TextTap → TTSChunker →           │
               │  TTS → Sink → AssistantAgg       │
               └────────┬────────┬────────┬───────┘
                        │        │        │
@@ -153,7 +155,7 @@ The pipeline is built inside `PipecatProvider.start_up()` and runs as a backgrou
 ### Pipeline Order
 
 ```
-VAD → STT → ASRTextCleaner → UserAgg → LLM → TextTap → TTS → Sink → AssistantAgg
+VAD → STT → ASRCleaner → UserAgg(+SmartTurn) → VisionInjector → LLM → TextTap → TTSChunker → TTS → Sink → AssistantAgg
 ```
 
 | Processor | Class | Purpose |
@@ -161,9 +163,11 @@ VAD → STT → ASRTextCleaner → UserAgg → LLM → TextTap → TTS → Sink 
 | **VAD** | `VADProcessor` | Silero VAD at 16 kHz; emits `VADUserStarted/StoppedSpeakingFrame` |
 | **STT** | `OpenAISTTService` | Qwen3-ASR via OpenAI-compatible API; buffers audio, commits on VAD stop |
 | **ASRTextCleaner** | Custom `FrameProcessor` | Strips `<asr_text>` prefix from Qwen ASR transcriptions |
-| **UserAgg** | `LLMUserAggregator` | Accumulates user turns into LLM context |
+| **UserAgg** | `LLMUserAggregator` | Accumulates user turns; uses pipecat's built-in Smart Turn v3.2 (ONNX) for turn-completion detection |
+| **VisionInjector** | Custom `FrameProcessor` | Per-turn camera injection — intercepts `LLMContextFrame` and attaches camera frame. Two modes: multimodal (base64 JPEG for VLMs) or text-only (scene description via VisionProcessor for text LLMs like Qwen3.5) |
 | **LLM** | `OpenAILLMService` | Qwen3.5-35B via ik-llama.cpp; thinking disabled via `chat_template_kwargs` |
 | **TextTap** | Custom `FrameProcessor` | Captures assistant text for Gradio chatbot display |
+| **TTSChunker** | Custom `FrameProcessor` | Waterfall text splitting (sentence→clause→phrase→word, max 150 chars) for faster time-to-first-audio |
 | **TTS** | `OpenAITTSService` | Qwen3-TTS; always outputs 24 kHz |
 | **Sink** | Custom `FrameProcessor` | Bridges TTS audio → fastrtc output queue; feeds HeadWobbler |
 | **AssistantAgg** | `LLMAssistantAggregator` | Accumulates assistant turns into LLM context |
@@ -463,6 +467,9 @@ All changes from the initial upstream fork to the current state:
 | 22 | `344cbe9` | Fix float32 audio from robot mic (LocalStream compatibility) |
 | 23 | `6c55020` | Save deployment status for continuity |
 | 24 | `4469734` | Subprocess-based camera frame capture fallback |
+| 25 | `a4bc945` | Smart-turn VAD gate and TTS text chunker |
+| 26 | `fbc3821` | Per-turn vision injection, built-in smart-turn, fix barge-in |
+| 27 | `632f376` | Make VisionInjector model-aware (multimodal vs text-only) |
 
 ---
 
@@ -473,7 +480,7 @@ All changes from the initial upstream fork to the current state:
 - **`<asr_text>` prefix**: Qwen3-ASR prepends `<asr_text>` to all transcriptions. The `ASRTextCleaner` processor strips it in the provider pipeline, but the standalone `test_pipeline.py` still shows it (cosmetic — doesn't affect functionality).
 - **GStreamer required on robot**: System packages needed for mic/speaker/camera. Already installed on the RPi. For other hosts: `sudo apt-get install -y gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-pulseaudio gir1.2-gst-plugins-base-1.0 gstreamer1.0-nice`
 - **v4l2h264enc broken on RPi 5**: Hardware H264 encoder fails. Must apply `scripts/patch-daemon-camera.sh` on the robot to switch to openh264enc. See [Camera Fix](#camera-fix-v4l2h264enc--openh264enc).
-- **Smart Turn timeout**: Pipecat's Smart Turn analyzer adds ~5s delay after the last VAD stop before committing the user turn. This is by design (waits for multi-sentence input) but may feel slow for single-sentence queries.
+- **Smart Turn timeout**: Pipecat's built-in Smart Turn v3.2 analyzer (bundled ONNX model, 8MB int8) adds ~5s delay after the last VAD stop before committing the user turn. This is by design (waits for multi-sentence input) but may feel slow for single-sentence queries. The analyzer uses Whisper feature extraction on the last 8s of audio to predict turn completion.
 
 ### What Works Now
 
@@ -482,7 +489,10 @@ All changes from the initial upstream fork to the current state:
 - Robot connected at 192.168.178.127 (movements, emotions, head control)
 - Gradio UI at http://0.0.0.0:7860 for browser-based audio interaction
 - LLM TTFB: 0.3s (thinking disabled via chat_template_kwargs)
-- Barge-in support, VAD-driven listening mode, head wobble from TTS audio
+- Barge-in support (allow_interruptions + output queue drain), VAD-driven listening mode, head wobble from TTS audio
+- Per-turn vision injection (VisionInjector: multimodal image for VLMs, text description for text-only LLMs)
+- TTS text chunking (waterfall split at sentence/clause/phrase/word boundaries, max 150 chars)
+- Smart Turn v3.2 turn-completion detection (pipecat built-in ONNX model)
 - Camera capture via unixfdsrc socket (1280×720 YUY2 from daemon) and subprocess fallback
 
 ### Camera Fix (v4l2h264enc → openh264enc)
@@ -515,10 +525,9 @@ The patch script (`scripts/patch-daemon-camera.sh`) supports both v1.5.x (`webrt
 
 | Area | Task | Priority |
 |------|------|----------|
-| **Camera** | Wire camera_worker into pipecat provider for continuous frame polling | Medium |
 | **MCP Integration** | Wire `MCPManager.start()` into `main.py` alongside `MovementManager` | Medium |
 | **Home Assistant** | Add HA token, wire state events from robot_server to HA | Medium |
-| **Vision** | Wire SmolVLM2 into vision_server, connect camera | Medium |
+| **Vision MCP** | Wire SmolVLM2 into vision_server MCP tool, connect camera | Medium |
 | **Memory** | Replace JSON store with SQLite/vector DB | Low |
 | **TTS Voices** | Query TTS endpoint for available voices in `get_available_voices()` | Low |
 | **Profile hot-reload** | Implement `apply_personality()` to rebuild LLMContext without pipeline restart | Low |

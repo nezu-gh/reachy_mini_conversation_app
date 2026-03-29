@@ -119,8 +119,9 @@ class PipecatProvider(ConversationProvider):
     async def apply_personality(self, profile: Optional[str]) -> str:
         """Update LLM system instructions at runtime.
 
-        TODO: rebuild the LLMContext with new instructions from the
-        profile and push an updated context frame into the pipeline.
+        Not yet implemented: would need to rebuild the LLMContext with
+        new instructions and push an updated context frame.  Currently
+        only takes effect after a pipeline restart.
         """
         from reachy_mini_conversation_app.config import set_custom_profile
 
@@ -131,7 +132,9 @@ class PipecatProvider(ConversationProvider):
     async def get_available_voices(self) -> List[str]:
         """Return voices available from the local TTS engine.
 
-        TODO: query TTS_BASE_URL/v1/voices or similar for voice list.
+        Not yet implemented: would need to query TTS_BASE_URL/v1/voices
+        or a similar endpoint.  Returns empty until a TTS voice listing
+        API is available.
         """
         return []
 
@@ -697,9 +700,6 @@ class PipecatProvider(ConversationProvider):
                     provider_ref.deps.movement_manager.set_listening(True)
                     logger.debug("User speech stopped (still listening)")
 
-                # TODO: capture FunctionCallResultFrame for tool call
-                # dispatch once tools are registered with the LLM.
-
                 # Always forward the frame so downstream processors
                 # (like assistant_aggregator) still see it.
                 await self.push_frame(frame, direction)
@@ -834,8 +834,8 @@ class PipecatProvider(ConversationProvider):
     async def send_idle_signal(self, idle_duration: float) -> None:
         """Send an idle nudge to the LLM so the robot does something.
 
-        TODO: inject a user-turn message into the LLMContext and queue
-        an LLMRunFrame so the model can invoke a tool (dance, emotion,
-        etc.).  For now this is a no-op — idle tools require the tool
-        registry to be wired first.
+        Not yet implemented: would inject a user-turn message into the
+        LLMContext and queue an LLMRunFrame so the model can invoke a
+        tool (dance, emotion, etc.).  Currently a no-op — requires the
+        tool registry to be wired into the pipeline first.
         """
