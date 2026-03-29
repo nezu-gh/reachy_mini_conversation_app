@@ -679,10 +679,13 @@ class PipecatProvider(ConversationProvider):
             async def run(self, task: PipelineTask) -> None:
                 """Background loop that feeds mic audio into the pipeline."""
                 _src_count = 0
+                logger.info("PipelineSource.run: started, waiting for audio frames")
                 while self._running:
                     try:
                         sr, audio = await asyncio.wait_for(provider_ref._audio_in_queue.get(), timeout=0.5)
                     except asyncio.TimeoutError:
+                        if _src_count == 0:
+                            logger.debug("PipelineSource.run: no audio yet (queue empty)")
                         continue
 
                     # Audio is already int16 after receive() conversion
@@ -697,6 +700,13 @@ class PipecatProvider(ConversationProvider):
                     # real-time chunks are typically 320 samples (20ms @ 16kHz),
                     # so skip noise reduction for now — it corrupts short frames.
                     # TODO: accumulate a buffer of ≥1024 samples before filtering.
+
+                    _src_count += 1
+                    if _src_count <= 3 or _src_count % 500 == 0:
+                        logger.info(
+                            "PipelineSource: frame #%d sr=%d samples=%d max=%d",
+                            _src_count, sr, len(audio), int(np.abs(audio).max()),
+                        )
 
                     audio_bytes = audio.tobytes()
                     frame = InputAudioRawFrame(
