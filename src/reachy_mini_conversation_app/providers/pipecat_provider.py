@@ -398,27 +398,40 @@ class PipecatProvider(ConversationProvider):
                 await self.push_frame(frame, direction)
 
         class VisionInjector(FrameProcessor):
-            """Attach a camera frame to every LLM turn.
+            """Attach a camera snapshot to every LLM turn.
 
             "Always capture, route later" pattern: on each
-            LLMContextFrame (the user aggregator pushing context to the
-            LLM), grab the latest camera frame, JPEG-encode it, and
-            inject it as a multimodal image in the last user message.
-            The LLM decides whether the image is relevant.
+            LLMContextFrame, grab the latest camera frame and inject
+            visual context into the last user message.
 
-            If no camera_worker is available or no frame is captured,
-            the context passes through unchanged.
+            Two modes depending on the LLM's capabilities:
+
+            1. **VLM / multimodal LLM** (``multimodal=True``):
+               JPEG-encode the frame and inject it as an ``image_url``
+               data-URI in OpenAI multimodal message format.
+
+            2. **Text-only LLM** with a local ``VisionProcessor``
+               (``multimodal=False``, ``vision_processor`` set):
+               Run SmolVLM2 on the frame to produce a short scene
+               description and inject it as a ``[scene: ...]`` text
+               prefix in the user message.
+
+            If neither mode is possible, the context passes through
+            unchanged.
             """
 
-            MAX_DIM = 512       # resize longest edge
-            JPEG_QUALITY = 60   # balance quality vs payload size
+            MAX_DIM = 512
+            JPEG_QUALITY = 60
+
+            def __init__(self, *, multimodal: bool = False) -> None:
+                super().__init__()
+                self._multimodal = multimodal
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
                 if not isinstance(frame, LLMContextFrame):
                     await self.push_frame(frame, direction)
                     return
 
-                # Grab camera frame (non-blocking, already buffered)
                 cam = provider_ref.deps.camera_worker
                 if cam is None:
                     await self.push_frame(frame, direction)
@@ -429,15 +442,24 @@ class PipecatProvider(ConversationProvider):
                     await self.push_frame(frame, direction)
                     return
 
-                # Encode in a thread to avoid blocking the event loop
-                b64_url = await asyncio.to_thread(
-                    self._encode_frame, raw_frame
-                )
+                if self._multimodal:
+                    await self._inject_image(frame, raw_frame, direction)
+                elif provider_ref.deps.vision_processor is not None:
+                    await self._inject_description(frame, raw_frame, direction)
+                else:
+                    # Text-only LLM, no vision processor → pass through
+                    await self.push_frame(frame, direction)
+                    return
+
+            async def _inject_image(
+                self, frame: Any, raw_frame: Any, direction: FrameDirection,
+            ) -> None:
+                """Inject base64 JPEG into the last user message (multimodal LLM)."""
+                b64_url = await asyncio.to_thread(self._encode_frame, raw_frame)
                 if b64_url is None:
                     await self.push_frame(frame, direction)
                     return
 
-                # Inject image into the last user message
                 messages = frame.context.get_messages()
                 for msg in reversed(messages):
                     if msg.get("role") == "user":
@@ -448,13 +470,36 @@ class PipecatProvider(ConversationProvider):
                                 {"type": "image_url", "image_url": {"url": b64_url}},
                             ]
                         elif isinstance(content, list):
-                            # Already multimodal — append image
                             content.append(
                                 {"type": "image_url", "image_url": {"url": b64_url}}
                             )
                         break
 
-                logger.debug("VisionInjector: attached camera frame to LLM context")
+                logger.debug("VisionInjector: attached image to LLM context")
+                await self.push_frame(frame, direction)
+
+            async def _inject_description(
+                self, frame: Any, raw_frame: Any, direction: FrameDirection,
+            ) -> None:
+                """Run local VLM and inject text description (text-only LLM)."""
+                try:
+                    desc = await asyncio.to_thread(
+                        provider_ref.deps.vision_processor.process_image,
+                        raw_frame,
+                        "Briefly describe the scene and any people visible.",
+                    )
+                    if desc and desc != "Vision model not initialized":
+                        messages = frame.context.get_messages()
+                        for msg in reversed(messages):
+                            if msg.get("role") == "user":
+                                text = msg.get("content", "")
+                                if isinstance(text, str):
+                                    msg["content"] = f"[scene: {desc}]\n{text}"
+                                break
+                        logger.debug("VisionInjector: injected scene description")
+                except Exception as e:
+                    logger.warning("VisionInjector: VLM failed: %s", e)
+
                 await self.push_frame(frame, direction)
 
             @staticmethod
@@ -672,7 +717,23 @@ class PipecatProvider(ConversationProvider):
 
         source = PipelineSource()
         asr_cleaner = ASRTextCleaner()
-        vision_injector = VisionInjector()
+
+        # Detect multimodal LLM by model name patterns
+        _multimodal_patterns = ("vlm", "vl-", "vision", "llava", "smolvlm")
+        _is_multimodal = any(p in LLM_MODEL.lower() for p in _multimodal_patterns)
+        vision_injector = VisionInjector(multimodal=_is_multimodal)
+
+        _has_vision = _is_multimodal or provider_ref.deps.vision_processor is not None
+        if _has_vision:
+            logger.info(
+                "VisionInjector: %s",
+                "multimodal LLM — injecting images"
+                if _is_multimodal
+                else "text-only LLM — injecting scene descriptions via VisionProcessor",
+            )
+        else:
+            logger.info("VisionInjector: disabled (text-only LLM, no VisionProcessor)")
+
         tts_chunker = TTSTextChunker(max_chars=150)
         text_tap = AssistantTextTap()
         sink = PipelineSink()
