@@ -378,12 +378,22 @@ class PipecatProvider(ConversationProvider):
     # AsyncStreamHandler audio contract
     # ------------------------------------------------------------------
 
+    _receive_count = 0
+
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
         """Accept an audio frame from fastrtc or LocalStream and forward into the pipeline.
 
         Handles both int16 (fastrtc/Gradio) and float32 (LocalStream/robot mic)
         input formats.  Resamples to the pipeline's 16 kHz if needed.
         """
+        PipecatProvider._receive_count += 1
+        if PipecatProvider._receive_count <= 3 or PipecatProvider._receive_count % 500 == 0:
+            try:
+                with open("/tmp/diag.log", "a") as _df:
+                    _df.write(f"[DIAG] receive #{PipecatProvider._receive_count} pipeline_task={'SET' if self._pipeline_task else 'NONE'}\n")
+                    _df.flush()
+            except Exception:
+                pass
         if self._pipeline_task is None:
             return
 
@@ -680,6 +690,12 @@ class PipecatProvider(ConversationProvider):
                 """Background loop that feeds mic audio into the pipeline."""
                 _src_count = 0
                 logger.info("PipelineSource.run: started, waiting for audio frames")
+                try:
+                    with open("/tmp/diag.log", "a") as _df:
+                        _df.write("[DIAG] PipelineSource.run started\n")
+                        _df.flush()
+                except Exception:
+                    pass
                 while self._running:
                     try:
                         sr, audio = await asyncio.wait_for(provider_ref._audio_in_queue.get(), timeout=0.5)

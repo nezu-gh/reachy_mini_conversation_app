@@ -502,6 +502,7 @@ class LocalStream:
         """Read mic frames from the recorder and forward them to the handler."""
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
         logger.info("Audio recording started at %d Hz", input_sample_rate)
+        import builtins as _b; _diag = open("/tmp/diag.log", "a"); _b.print(f"[DIAG] record_loop started, sample_rate={input_sample_rate}", file=_diag, flush=True)
 
         _consecutive_errors = 0
         _frame_count = 0
@@ -513,6 +514,7 @@ class LocalStream:
                 if audio_frame is not None:
                     _frame_count += 1
                     if _frame_count <= 3 or _frame_count % 500 == 0:
+                        _b.print(f"[DIAG] record_loop frame #{_frame_count} shape={audio_frame.shape} dtype={audio_frame.dtype}", file=_diag, flush=True)
                         logger.info(
                             "record_loop: frame #%d shape=%s dtype=%s",
                             _frame_count, audio_frame.shape, audio_frame.dtype,
