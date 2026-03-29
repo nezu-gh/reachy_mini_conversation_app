@@ -387,7 +387,7 @@ class PipecatProvider(ConversationProvider):
         input formats.  Resamples to the pipeline's 16 kHz if needed.
         """
         PipecatProvider._receive_count += 1
-        if PipecatProvider._receive_count <= 3 or PipecatProvider._receive_count % 500 == 0:
+        if PipecatProvider._receive_count <= 5 or PipecatProvider._receive_count % 50 == 0:
             try:
                 with open("/tmp/diag.log", "a") as _df:
                     _df.write(f"[DIAG] receive #{PipecatProvider._receive_count} pipeline_task={'SET' if self._pipeline_task else 'NONE'} queue_id={id(self._audio_in_queue)} qsize={self._audio_in_queue.qsize()}\n")
