@@ -65,6 +65,8 @@ class ToolDependencies:
     camera_worker: Any | None = None  # CameraWorker for frame buffering
     vision_processor: Any | None = None
     head_wobbler: Any | None = None  # HeadWobbler for audio-reactive motion
+    output_queue: Any | None = None  # asyncio.Queue for audio output (set by provider)
+    audio_sample_rate: int = 24000  # Output sample rate for audio frames
     motion_duration_s: float = 1.0
 
 

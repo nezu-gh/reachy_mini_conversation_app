@@ -772,6 +772,10 @@ class PipecatProvider(ConversationProvider):
         self._pipeline_task = task
         self._source = source
 
+        # Expose output_queue to tools so they can inject audio directly
+        self.deps.output_queue = self.output_queue
+        self.deps.audio_sample_rate = FASTRTC_SAMPLE_RATE
+
         # Kick off the pipeline in a background asyncio task
         runner = PipelineRunner(handle_sigint=False)
 

@@ -5,4 +5,5 @@ stop_emotion
 move_head
 camera
 do_nothing
+micro_expression
 # head_tracking is commented out — CPU-intensive on local hardware
