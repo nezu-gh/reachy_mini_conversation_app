@@ -456,6 +456,9 @@ All changes from the initial upstream fork to the current state:
 | 15 | `c802b6e` | Fix model IDs, initial `enable_thinking: false` attempt |
 | 16 | `a04f6d1` | Remove broken `enable_thinking` hack, document pipecat native handling |
 | 17 | `e4c131a` | `chat_template_kwargs` fix (TTFB 85s→0.24s), ASR text cleaner, test fixes |
+| 18 | `ed31c2b` | Comprehensive R3-MN1 documentation |
+| 19 | `913b4cc` | Remote robot connection, `no_media` for pipecat, network mode override |
+| 20 | `00a87f9` | Register 9 robot tools with pipecat LLM, fix STT/TTS settings deprecation |
 
 ---
 
@@ -464,14 +467,25 @@ All changes from the initial upstream fork to the current state:
 ### Active Issues
 
 - **`<asr_text>` prefix**: Qwen3-ASR prepends `<asr_text>` to all transcriptions. The `ASRTextCleaner` processor strips it in the provider pipeline, but the standalone `test_pipeline.py` still shows it (cosmetic — doesn't affect functionality).
-- **Robot daemon**: Reachy Mini at 192.168.178.127 needs its daemon running to test the full application (provider + robot movement).
+- **GStreamer not installed**: System packages required for robot mic/speaker/camera. Install with: `sudo apt-get install -y gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-pulseaudio gir1.2-gst-plugins-base-1.0 gstreamer1.0-nice`
+- **Gradio mode works without GStreamer**: Audio flows through browser WebRTC, robot used only for movements/emotions. Headless mode (LocalStream with robot mic/speaker) requires GStreamer.
 - **Smart Turn timeout**: Pipecat's Smart Turn analyzer adds ~5s delay after the last VAD stop before committing the user turn. This is by design (waits for multi-sentence input) but may feel slow for single-sentence queries.
+
+### What Works Now
+
+- Full STT→LLM→TTS pipeline (Qwen-ASR + Qwen3.5-35B + Qwen3-TTS) tested end-to-end
+- 9 robot tools registered: dance, stop_dance, play_emotion, stop_emotion, move_head, camera, do_nothing, task_cancel, task_status
+- Robot connected at 192.168.178.127 (movements, emotions, head control)
+- Gradio UI at http://0.0.0.0:7860 for browser-based audio interaction
+- LLM TTFB: 0.3s (thinking disabled via chat_template_kwargs)
+- Barge-in support, VAD-driven listening mode, head wobble from TTS audio
 
 ### TODOs
 
 | Area | Task | Priority |
 |------|------|----------|
-| **LLM Tools** | Register robot tools via `llm.register_function()` + `FunctionCallProcessor` | High |
+| **GStreamer** | Install GStreamer for robot mic/speaker/camera access (requires system packages) | High |
+| **Camera** | Enable camera_worker (currently `--no-camera` due to GStreamer dependency) | High |
 | **MCP Integration** | Wire `MCPManager.start()` into `main.py` alongside `MovementManager` | Medium |
 | **Home Assistant** | Add HA token, wire state events from robot_server to HA | Medium |
 | **Vision** | Wire SmolVLM2 into vision_server, connect camera | Medium |
