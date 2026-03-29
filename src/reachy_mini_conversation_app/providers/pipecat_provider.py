@@ -72,6 +72,75 @@ FASTRTC_SAMPLE_RATE = 24000
 PIPELINE_SAMPLE_RATE = 16000
 
 
+def _probe_service(name: str, base_url: str, timeout: float = 5.0) -> bool:
+    """HTTP GET ``base_url/models`` to check if a service is reachable."""
+    import urllib.request
+    import urllib.error
+
+    url = f"{base_url}/models"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout):
+            pass
+        logger.info("Health check OK: %s @ %s", name, base_url)
+        return True
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        logger.warning("Health check FAILED: %s @ %s — %s", name, base_url, exc)
+        return False
+
+
+def _check_services() -> None:
+    """Pre-flight health check for all three VM services.
+
+    Retries up to 3 times with 5s backoff.  Logs clear errors but does
+    **not** abort — the pipeline may still recover if the service comes
+    up later.
+    """
+    import time as _time
+
+    services = [
+        ("ASR", ASR_BASE_URL),
+        ("LLM", LLM_BASE_URL),
+        ("TTS", TTS_BASE_URL),
+    ]
+    for attempt in range(1, 4):
+        failed = [(n, u) for n, u in services if not _probe_service(n, u)]
+        if not failed:
+            return
+        if attempt < 3:
+            logger.warning(
+                "Service health check attempt %d/3: %s unreachable — retrying in 5s",
+                attempt, ", ".join(n for n, _ in failed),
+            )
+            _time.sleep(5)
+    logger.error(
+        "SERVICE HEALTH CHECK: %s still unreachable after 3 attempts. "
+        "Pipeline may fail at runtime.",
+        ", ".join(n for n, _ in failed),
+    )
+
+
+def _warm_up_tts() -> None:
+    """Send a short TTS request to prime the model (eliminates cold-start latency)."""
+    import urllib.request
+    import urllib.error
+
+    url = f"{TTS_BASE_URL}/audio/speech"
+    body = json.dumps({
+        "model": TTS_MODEL,
+        "input": "Hello.",
+        "voice": "alloy",
+        "response_format": "wav",
+    }).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()  # discard audio
+        logger.info("TTS warm-up complete")
+    except Exception as exc:
+        logger.warning("TTS warm-up failed (non-fatal): %s", exc)
+
+
 class PipecatProvider(ConversationProvider):
     """Fully-local conversation backend powered by pipecat-ai.
 
@@ -114,6 +183,7 @@ class PipecatProvider(ConversationProvider):
         self.start_time: float = 0.0
         self._barge_in: bool = False
         self._barge_in_time: float = 0.0
+        self._last_emit_time: float = 0.0
 
     # ------------------------------------------------------------------
     # ConversationProvider abstract methods
@@ -206,8 +276,22 @@ class PipecatProvider(ConversationProvider):
                     return None
                 self.last_activity_time = asyncio.get_event_loop().time()
 
+            # Watchdog: warn if no audio has been emitted for a long time
+            # during what should be an active conversation.
+            if self._last_emit_time > 0:
+                silence_gap = now - self._last_emit_time
+                if silence_gap > 30.0:
+                    logger.warning(
+                        "Emit watchdog: no output for %.0fs (barge_in=%s)",
+                        silence_gap, self._barge_in,
+                    )
+                    self._last_emit_time = now  # reset so we don't spam
+
             try:
-                return await asyncio.wait_for(self.output_queue.get(), timeout=1.0)
+                item = await asyncio.wait_for(self.output_queue.get(), timeout=1.0)
+                if isinstance(item, tuple):
+                    self._last_emit_time = asyncio.get_event_loop().time()
+                return item
             except asyncio.TimeoutError:
                 continue  # loop back to check _barge_in / idle
 
@@ -243,10 +327,16 @@ class PipecatProvider(ConversationProvider):
         )
 
         from reachy_mini_conversation_app.prompts import get_session_instructions
+        import threading as _threading
 
         loop = asyncio.get_event_loop()
         self.start_time = loop.time()
         self.last_activity_time = loop.time()
+
+        # Pre-flight: verify all VM services are reachable
+        _check_services()
+        # Warm up TTS in background so it doesn't block pipeline start
+        _threading.Thread(target=_warm_up_tts, daemon=True, name="tts-warmup").start()
 
         logger.info(
             "PipecatProvider: building pipeline  LLM=%s@%s  STT=%s@%s  TTS=%s@%s",
@@ -404,12 +494,23 @@ class PipecatProvider(ConversationProvider):
             def stop(self) -> None:
                 self._running = False
 
+        # CJK Unicode ranges for noise detection
+        _CJK_RE = re.compile(
+            r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u3400-\u4dbf]'
+        )
+
         class ASRTextCleaner(FrameProcessor):
-            """Strips Qwen ASR prefix tags from transcription text.
+            """Strips Qwen ASR prefix tags and filters noise transcriptions.
 
             Qwen3-ASR returns text like '<asr_text>Hello world.' — this
             processor removes the prefix so the LLM sees clean text.
+
+            Also filters noise: the model transcribes ambient sounds
+            (fans, hum) as CJK characters.  Transcripts that are too
+            short, whitespace-only, or predominantly non-Latin are dropped.
             """
+
+            MIN_LENGTH = 2  # minimum chars for a valid transcript
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
                 await super().process_frame(frame, direction)
@@ -418,6 +519,54 @@ class PipecatProvider(ConversationProvider):
                     cleaned = text.replace("<asr_text>", "").strip()
                     if cleaned != text:
                         frame.text = cleaned
+                        text = cleaned
+
+                    # Drop noise transcriptions
+                    if self._is_noise(text):
+                        logger.debug("ASR noise filtered: %r", text)
+                        return  # swallow frame — don't push downstream
+
+                await self.push_frame(frame, direction)
+
+            @staticmethod
+            def _is_noise(text: str) -> bool:
+                """Return True if the transcript looks like noise, not speech."""
+                if not text or len(text) < ASRTextCleaner.MIN_LENGTH:
+                    return True
+                # Predominantly CJK → noise (Qwen ASR hallucination on ambient sound)
+                cjk_count = len(_CJK_RE.findall(text))
+                if cjk_count > 0 and cjk_count / len(text) > 0.3:
+                    return True
+                # Pure punctuation / symbols
+                if not any(c.isalnum() for c in text):
+                    return True
+                return False
+
+        class ContextTrimmer(FrameProcessor):
+            """Trim old messages from the LLM context to prevent OOM on RPi 4.
+
+            On every LLMContextFrame, check the number of messages.  If it
+            exceeds ``max_turns``, drop the oldest non-system messages to
+            keep the context bounded.  This prevents unbounded memory
+            growth during long conversations.
+            """
+
+            MAX_TURNS = 40  # keep at most this many messages (excl. system)
+
+            async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+                await super().process_frame(frame, direction)
+                if isinstance(frame, LLMContextFrame):
+                    messages = frame.context.get_messages()
+                    non_system = [m for m in messages if m.get("role") != "system"]
+                    if len(non_system) > self.MAX_TURNS:
+                        # Keep system messages + last MAX_TURNS non-system messages
+                        system_msgs = [m for m in messages if m.get("role") == "system"]
+                        trimmed = system_msgs + non_system[-self.MAX_TURNS:]
+                        frame.context.set_messages(trimmed)
+                        logger.info(
+                            "ContextTrimmer: trimmed %d → %d messages",
+                            len(messages), len(trimmed),
+                        )
                 await self.push_frame(frame, direction)
 
         class VisionInjector(FrameProcessor):
@@ -829,8 +978,8 @@ class PipecatProvider(ConversationProvider):
         # with audio_in/out sample rates from PipelineParams.
         #
         # Pipeline order:
-        #   VAD → STT → ASRCleaner → user_agg(+smart-turn) → VisionInjector
-        #     → LLM → text_tap → TTSChunker → TTS → sink → assistant_agg
+        #   VAD → STT → ASRCleaner → user_agg(+smart-turn) → ContextTrimmer
+        #     → VisionInjector → LLM → text_tap → TTSChunker → TTS → sink → assistant_agg
         #
         # PipelineSource runs as a separate asyncio task and injects
         # InputAudioRawFrame via task.queue_frame().
@@ -854,6 +1003,7 @@ class PipecatProvider(ConversationProvider):
         else:
             logger.info("VisionInjector: disabled (text-only LLM, no VisionProcessor)")
 
+        context_trimmer = ContextTrimmer()
         tts_chunker = TTSTextChunker(max_chars=150)
         text_tap = AssistantTextTap()
         sink = PipelineSink()
@@ -867,8 +1017,9 @@ class PipecatProvider(ConversationProvider):
             [
                 vad,              # analyse audio for speech boundaries
                 stt,              # transcribe speech segments
-                asr_cleaner,      # strip <asr_text> prefix from Qwen ASR
+                asr_cleaner,      # strip <asr_text> prefix + noise filter
                 user_agg,         # accumulate user turns + smart-turn detection
+                context_trimmer,  # trim old messages to prevent OOM
                 vision_injector,  # attach camera frame to every LLM context
                 llm,              # generate response
                 text_tap,         # capture assistant text before TTS

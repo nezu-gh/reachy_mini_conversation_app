@@ -305,12 +305,28 @@ def _safe_load_obj(args_json: str) -> Dict[str, Any]:
         return {}
 
 
+_MAX_TOOL_RESULT_BYTES = 4096  # 4 KB — keep tool results small for the LLM context
+
+
+def _truncate_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Truncate tool result if its JSON representation exceeds _MAX_TOOL_RESULT_BYTES."""
+    serialized = json.dumps(result)
+    if len(serialized) <= _MAX_TOOL_RESULT_BYTES:
+        return result
+    logger.warning(
+        "Tool result truncated: %d bytes → %d bytes",
+        len(serialized), _MAX_TOOL_RESULT_BYTES,
+    )
+    return {"result": serialized[:_MAX_TOOL_RESULT_BYTES - 50] + "… (truncated)"}
+
+
 async def _dispatch_tool_call(tool_name: str, args: Dict[str, Any], deps: ToolDependencies) -> Dict[str, Any]:
     tool = ALL_TOOLS.get(tool_name)
     if not tool:
         return {"error": f"unknown tool: {tool_name}"}
     try:
-        return await tool(deps, **args)
+        result = await tool(deps, **args)
+        return _truncate_result(result)
     except asyncio.CancelledError:
         logger.info("Tool cancelled: %s", tool_name)
         return {"error": "Tool cancelled"}
