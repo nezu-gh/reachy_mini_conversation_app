@@ -15,6 +15,7 @@ def test_config_raises_on_external_profile_name_collision(
 
     monkeypatch.setattr(config_mod.Config, "PROFILES_DIRECTORY", external_profiles)
     monkeypatch.setattr(config_mod.Config, "TOOLS_DIRECTORY", None)
+    monkeypatch.setattr(config_mod.Config, "REACHY_MINI_CUSTOM_PROFILE", None)
 
     with pytest.raises(RuntimeError, match="Ambiguous profile names"):
         config_mod.Config()
@@ -30,6 +31,7 @@ def test_config_raises_on_external_profile_name_collision_with_builtin_alias(
 
     monkeypatch.setattr(config_mod.Config, "PROFILES_DIRECTORY", external_profiles)
     monkeypatch.setattr(config_mod.Config, "TOOLS_DIRECTORY", None)
+    monkeypatch.setattr(config_mod.Config, "REACHY_MINI_CUSTOM_PROFILE", None)
 
     with pytest.raises(RuntimeError, match="Ambiguous profile names"):
         config_mod.Config()

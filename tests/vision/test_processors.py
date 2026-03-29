@@ -6,7 +6,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from reachy_mini_conversation_app.vision.processors import (
+torch = pytest.importorskip("torch", reason="torch required for vision tests")
+
+from reachy_mini_conversation_app.vision.processors import (  # noqa: E402
     LOCAL_VISION_RESPONSE_INSTRUCTIONS,
     VisionConfig,
     VisionProcessor,

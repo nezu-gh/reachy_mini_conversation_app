@@ -1,20 +1,17 @@
 """Tests for the camera tool."""
 
-import base64
-from io import BytesIO
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from PIL import Image
 
 from reachy_mini_conversation_app.tools.camera import Camera
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 
 
 @pytest.mark.asyncio
-async def test_camera_tool_preserves_frame_color_for_uploaded_jpeg() -> None:
-    """The JPEG uploaded to the model should preserve the intended frame color."""
+async def test_camera_tool_returns_error_without_vision_processor() -> None:
+    """Without a vision processor the tool should refuse to dump raw base64."""
     camera_worker = MagicMock()
     camera_worker.get_latest_frame.return_value = np.full((32, 32, 3), [0, 0, 255], dtype=np.uint8)
 
@@ -26,17 +23,8 @@ async def test_camera_tool_preserves_frame_color_for_uploaded_jpeg() -> None:
 
     result = await Camera()(deps, question="What color is this?")
 
-    assert "b64_im" in result
-
-    jpeg_bytes = base64.b64decode(result["b64_im"])
-    decoded = Image.open(BytesIO(jpeg_bytes)).convert("RGB")
-    pixel = decoded.getpixel((0, 0))
-    assert isinstance(pixel, tuple)
-    red, green, blue = pixel
-
-    assert red > 200
-    assert green < 40
-    assert blue < 40
+    assert "error" in result
+    assert "vision" in result["error"].lower()
 
 
 @pytest.mark.asyncio
@@ -62,3 +50,23 @@ async def test_camera_tool_uses_local_vision_processor_when_available() -> None:
         camera_worker.get_latest_frame.return_value,
         "What do you see?",
     )
+
+
+@pytest.mark.asyncio
+async def test_camera_tool_returns_error_without_frame() -> None:
+    """No frame from any source should return a clear error."""
+    camera_worker = MagicMock()
+    camera_worker.get_latest_frame.return_value = None
+
+    deps = ToolDependencies(
+        reachy_mini=MagicMock(),
+        movement_manager=MagicMock(),
+        camera_worker=camera_worker,
+    )
+
+    # Patch capture_frame at its source module so the lazy import picks it up
+    from unittest.mock import patch
+    with patch("reachy_mini_conversation_app.camera_capture.capture_frame", return_value=None):
+        result = await Camera()(deps, question="What do you see?")
+
+    assert "error" in result

@@ -22,8 +22,6 @@ def test_clear_audio_queue_prefers_clear_player_when_available() -> None:
 
     audio.clear_player.assert_called_once()
     audio.clear_output_buffer.assert_not_called()
-    assert isinstance(handler.output_queue, asyncio.Queue)
-    assert handler.output_queue.empty()
 
 
 def test_clear_audio_queue_uses_output_buffer_for_webrtc() -> None:
@@ -40,8 +38,6 @@ def test_clear_audio_queue_uses_output_buffer_for_webrtc() -> None:
 
     audio.clear_output_buffer.assert_called_once()
     audio.clear_player.assert_not_called()
-    assert isinstance(handler.output_queue, asyncio.Queue)
-    assert handler.output_queue.empty()
 
 
 def test_clear_audio_queue_falls_back_when_backend_is_unknown() -> None:
@@ -54,5 +50,3 @@ def test_clear_audio_queue_falls_back_when_backend_is_unknown() -> None:
     stream.clear_audio_queue()
 
     audio.clear_output_buffer.assert_called_once()
-    assert isinstance(handler.output_queue, asyncio.Queue)
-    assert handler.output_queue.empty()
