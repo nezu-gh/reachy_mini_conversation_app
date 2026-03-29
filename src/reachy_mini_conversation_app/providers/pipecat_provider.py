@@ -237,7 +237,7 @@ class PipecatProvider(ConversationProvider):
         stt = OpenAISTTService(
             api_key="not-needed",
             base_url=ASR_BASE_URL,
-            model=ASR_MODEL,
+            settings=OpenAISTTService.Settings(model=ASR_MODEL),
         )
 
         llm = OpenAILLMService(
@@ -263,7 +263,7 @@ class PipecatProvider(ConversationProvider):
         tts = OpenAITTSService(
             api_key="not-needed",
             base_url=TTS_BASE_URL,
-            model=TTS_MODEL,
+            settings=OpenAITTSService.Settings(model=TTS_MODEL),
         )
 
         # ---- VAD ---------------------------------------------------------
@@ -275,14 +275,59 @@ class PipecatProvider(ConversationProvider):
             vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE),
         )
 
-        # ---- Tool registration (deferred) --------------------------------
-        # TODO: register robot tools with the LLM via llm.register_function()
-        # so tool calls flow through pipecat's FunctionCallProcessor.
-        # For now the LLM has no tools configured.
+        # ---- Tool registration --------------------------------------------
+        # Convert the app's tool specs to OpenAI-compatible format and register
+        # a catch-all handler that dispatches to the existing tool registry.
+
+        from pipecat.adapters.schemas.function_schema import FunctionSchema
+        from pipecat.adapters.schemas.tools_schema import ToolsSchema
+        from reachy_mini_conversation_app.tools.core_tools import (
+            get_tool_specs,
+            dispatch_tool_call,
+        )
+
+        tool_specs = get_tool_specs()
+        # Convert app tool specs to pipecat FunctionSchema objects
+        function_schemas = []
+        for spec in tool_specs:
+            params = spec.get("parameters", {})
+            function_schemas.append(FunctionSchema(
+                name=spec["name"],
+                description=spec.get("description", ""),
+                properties=params.get("properties", {}),
+                required=params.get("required", []),
+            ))
+        openai_tools = ToolsSchema(standard_tools=function_schemas)
+
+        provider_ref_for_tools = self
+
+        async def _handle_tool_call(params) -> None:
+            """Catch-all handler for all pipecat function calls."""
+            fn_name = params.function_name
+            args_json = params.arguments
+            tool_call_id = params.tool_call_id
+
+            logger.info("Tool call: %s(%s) [%s]", fn_name, args_json, tool_call_id)
+
+            result = await dispatch_tool_call(fn_name, args_json, provider_ref_for_tools.deps)
+
+            import json
+            await params.result_callback(json.dumps(result))
+
+            # Notify UI about tool usage
+            await provider_ref_for_tools.output_queue.put(
+                AdditionalOutputs({"role": "assistant", "content": f"Tool {fn_name}: {result}"})
+            )
+
+        # Register catch-all (function_name=None handles all tool calls)
+        llm.register_function(None, _handle_tool_call)
+
+        logger.info("Registered %d tools with LLM: %s",
+                     len(tool_specs), [s["name"] for s in tool_specs])
 
         # ---- Context & aggregators ---------------------------------------
 
-        context = LLMContext()
+        context = LLMContext(tools=openai_tools)
 
         # No vad_analyzer in user_params — the standalone VADProcessor
         # already broadcasts VAD frames into the pipeline.
