@@ -76,11 +76,6 @@ def run(
                 robot_kwargs["host"] = args.robot_name
                 robot_kwargs["connection_mode"] = "network"
 
-            # When using the pipecat provider, audio is handled by our own
-            # pipeline — skip GStreamer media to avoid the Gst dependency.
-            if getattr(args, "provider", "openai") == "pipecat":
-                robot_kwargs["media_backend"] = "no_media"
-
             logger.info("Initializing ReachyMini (SDK will auto-detect appropriate backend)")
             robot = ReachyMini(**robot_kwargs)
 
@@ -251,10 +246,6 @@ class ReachyMiniConversationApp(ReachyMiniApp):  # type: ignore[misc]
 
     def __init__(self, **kwargs: Any) -> None:
         args, _ = parse_args()
-        # When using the pipecat provider, audio is handled by our own
-        # pipeline — skip GStreamer media to avoid the Gst dependency.
-        if getattr(args, "provider", "openai") == "pipecat":
-            self.request_media_backend = "no_media"
         # When --robot-name is set, the robot is remote — force network mode
         # even if something else is listening on localhost:8000.
         if args.robot_name is not None:
