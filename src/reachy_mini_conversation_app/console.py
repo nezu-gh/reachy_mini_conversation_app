@@ -377,6 +377,14 @@ class LocalStream:
         # Start media after key is set/available
         self._robot.media.start_recording()
         self._robot.media.start_playing()
+
+        # Limit queued playback buffers: if audio backs up (e.g. during
+        # barge-in), old buffers are automatically dropped.  ~50 buffers
+        # ≈ 1s of audio at 16 kHz.
+        audio = getattr(self._robot.media, "audio", None)
+        if audio is not None and hasattr(audio, "set_max_output_buffers"):
+            audio.set_max_output_buffers(50)
+
         time.sleep(1)  # give some time to the pipelines to start
 
         async def runner() -> None:
@@ -495,16 +503,7 @@ class LocalStream:
                 input_sample_rate, audio_data = handler_output
                 output_sample_rate = self._robot.media.get_output_audio_samplerate()
 
-                # Reshape if needed
-                if audio_data.ndim == 2:
-                    # Scipy channels last convention
-                    if audio_data.shape[1] > audio_data.shape[0]:
-                        audio_data = audio_data.T
-                    # Multiple channels -> Mono channel
-                    if audio_data.shape[1] > 1:
-                        audio_data = audio_data[:, 0]
-
-                # Cast if needed
+                # Cast to float32 (MediaManager handles channel adaptation)
                 audio_frame = audio_to_float32(audio_data)
 
                 # Resample if needed

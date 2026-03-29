@@ -71,8 +71,78 @@ ASR_MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
 FASTRTC_SAMPLE_RATE = 24000
 PIPELINE_SAMPLE_RATE = 16000
 
+# ---------------------------------------------------------------------------
+# Testable pure functions (extracted from inner FrameProcessor classes)
+# ---------------------------------------------------------------------------
 
-def _probe_service(name: str, base_url: str, timeout: float = 5.0) -> bool:
+# CJK Unicode ranges for ASR noise detection
+_CJK_RE = re.compile(
+    r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u3400-\u4dbf]'
+)
+
+_ASR_MIN_LENGTH = 2  # minimum chars for a valid transcript
+
+
+def _is_noise(text: str) -> bool:
+    """Return True if a transcript looks like noise rather than real speech.
+
+    Qwen3-ASR hallucinates CJK characters on ambient sound (fans, hum).
+    Also rejects empty, too-short, and punctuation-only transcripts.
+    """
+    if not text or len(text) < _ASR_MIN_LENGTH:
+        return True
+    cjk_count = len(_CJK_RE.findall(text))
+    if cjk_count > 0 and cjk_count / len(text) > 0.3:
+        return True
+    if not any(c.isalnum() for c in text):
+        return True
+    return False
+
+
+def _trim_context(messages: list[dict], max_turns: int = 40) -> list[dict] | None:
+    """Trim old non-system messages if the context exceeds *max_turns*.
+
+    Returns the trimmed list, or ``None`` if no trimming was needed.
+    """
+    non_system = [m for m in messages if m.get("role") != "system"]
+    if len(non_system) <= max_turns:
+        return None
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    return system_msgs + non_system[-max_turns:]
+
+
+# Regex to catch tool calls written as plain text by the LLM
+_TOOL_TEXT_RE = re.compile(
+    r'(micro_expression|play_emotion|move_head|dance|stop_dance|stop_emotion|do_nothing)'
+    r'\(([^)]*)\)',
+)
+# Markdown-style: "*Micro-expression: laugh*"
+_MARKDOWN_EXPR_RE = re.compile(
+    r'\*[Mm]icro[- _]expression:\s*(\w+)\*',
+)
+
+
+def _extract_inline_tool_calls(text: str) -> list[tuple[str, str]]:
+    """Extract tool-call-like patterns from LLM output text.
+
+    Returns a list of ``(function_name, raw_arg)`` tuples found in *text*.
+    Does **not** dispatch them — the caller is responsible for that.
+    """
+    results: list[tuple[str, str]] = []
+    for m in _TOOL_TEXT_RE.finditer(text):
+        results.append((m.group(1), m.group(2).strip().strip("'\"")))
+    for m in _MARKDOWN_EXPR_RE.finditer(text):
+        results.append(("micro_expression", m.group(1).lower()))
+    return results
+
+
+def _strip_inline_tool_calls(text: str) -> str:
+    """Remove tool-call patterns from *text* (for TTS output)."""
+    cleaned = _TOOL_TEXT_RE.sub("", text)
+    return _MARKDOWN_EXPR_RE.sub("", cleaned).strip()
+
+
+def _probe_service(name: str, base_url: str, timeout: float = 2.0) -> bool:
     """HTTP GET ``base_url/models`` to check if a service is reachable."""
     import urllib.request
     import urllib.error
@@ -92,9 +162,9 @@ def _probe_service(name: str, base_url: str, timeout: float = 5.0) -> bool:
 def _check_services() -> None:
     """Pre-flight health check for all three VM services.
 
-    Retries up to 3 times with 5s backoff.  Logs clear errors but does
+    Retries up to 3 times with 2s backoff.  Logs clear errors but does
     **not** abort — the pipeline may still recover if the service comes
-    up later.
+    up later.  Designed to run in a background thread.
     """
     import time as _time
 
@@ -109,10 +179,10 @@ def _check_services() -> None:
             return
         if attempt < 3:
             logger.warning(
-                "Service health check attempt %d/3: %s unreachable — retrying in 5s",
+                "Service health check attempt %d/3: %s unreachable — retrying in 2s",
                 attempt, ", ".join(n for n, _ in failed),
             )
-            _time.sleep(5)
+            _time.sleep(2)
     logger.error(
         "SERVICE HEALTH CHECK: %s still unreachable after 3 attempts. "
         "Pipeline may fail at runtime.",
@@ -333,9 +403,8 @@ class PipecatProvider(ConversationProvider):
         self.start_time = loop.time()
         self.last_activity_time = loop.time()
 
-        # Pre-flight: verify all VM services are reachable
-        _check_services()
-        # Warm up TTS in background so it doesn't block pipeline start
+        # Pre-flight checks in background threads (non-blocking)
+        _threading.Thread(target=_check_services, daemon=True, name="health-check").start()
         _threading.Thread(target=_warm_up_tts, daemon=True, name="tts-warmup").start()
 
         logger.info(
@@ -494,23 +563,8 @@ class PipecatProvider(ConversationProvider):
             def stop(self) -> None:
                 self._running = False
 
-        # CJK Unicode ranges for noise detection
-        _CJK_RE = re.compile(
-            r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u3400-\u4dbf]'
-        )
-
         class ASRTextCleaner(FrameProcessor):
-            """Strips Qwen ASR prefix tags and filters noise transcriptions.
-
-            Qwen3-ASR returns text like '<asr_text>Hello world.' — this
-            processor removes the prefix so the LLM sees clean text.
-
-            Also filters noise: the model transcribes ambient sounds
-            (fans, hum) as CJK characters.  Transcripts that are too
-            short, whitespace-only, or predominantly non-Latin are dropped.
-            """
-
-            MIN_LENGTH = 2  # minimum chars for a valid transcript
+            """Strips Qwen ASR prefix tags and filters noise transcriptions."""
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
                 await super().process_frame(frame, direction)
@@ -520,48 +574,20 @@ class PipecatProvider(ConversationProvider):
                     if cleaned != text:
                         frame.text = cleaned
                         text = cleaned
-
-                    # Drop noise transcriptions
-                    if self._is_noise(text):
+                    if _is_noise(text):
                         logger.debug("ASR noise filtered: %r", text)
-                        return  # swallow frame — don't push downstream
-
+                        return
                 await self.push_frame(frame, direction)
 
-            @staticmethod
-            def _is_noise(text: str) -> bool:
-                """Return True if the transcript looks like noise, not speech."""
-                if not text or len(text) < ASRTextCleaner.MIN_LENGTH:
-                    return True
-                # Predominantly CJK → noise (Qwen ASR hallucination on ambient sound)
-                cjk_count = len(_CJK_RE.findall(text))
-                if cjk_count > 0 and cjk_count / len(text) > 0.3:
-                    return True
-                # Pure punctuation / symbols
-                if not any(c.isalnum() for c in text):
-                    return True
-                return False
-
         class ContextTrimmer(FrameProcessor):
-            """Trim old messages from the LLM context to prevent OOM on RPi 4.
-
-            On every LLMContextFrame, check the number of messages.  If it
-            exceeds ``max_turns``, drop the oldest non-system messages to
-            keep the context bounded.  This prevents unbounded memory
-            growth during long conversations.
-            """
-
-            MAX_TURNS = 40  # keep at most this many messages (excl. system)
+            """Trim old messages from the LLM context to prevent OOM on RPi 4."""
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
                 await super().process_frame(frame, direction)
                 if isinstance(frame, LLMContextFrame):
                     messages = frame.context.get_messages()
-                    non_system = [m for m in messages if m.get("role") != "system"]
-                    if len(non_system) > self.MAX_TURNS:
-                        # Keep system messages + last MAX_TURNS non-system messages
-                        system_msgs = [m for m in messages if m.get("role") == "system"]
-                        trimmed = system_msgs + non_system[-self.MAX_TURNS:]
+                    trimmed = _trim_context(messages)
+                    if trimmed is not None:
                         frame.context.set_messages(trimmed)
                         logger.info(
                             "ContextTrimmer: trimmed %d → %d messages",
@@ -781,35 +807,26 @@ class PipecatProvider(ConversationProvider):
                                 return m.end()
                 return None
 
-        # Regex to catch tool calls written as plain text by the LLM
-        # (e.g. "micro_expression(happy)" or "play_emotion(joy)")
-        _TOOL_TEXT_RE = re.compile(
-            r'(micro_expression|play_emotion|move_head|dance|stop_dance|stop_emotion|do_nothing)'
-            r'\(([^)]*)\)',
-        )
-        # Also catch markdown-style expressions the LLM sometimes writes
-        # e.g. "*Micro-expression: laugh*" or "*micro-expression: happy*"
-        _MARKDOWN_EXPR_RE = re.compile(
-            r'\*[Mm]icro[- _]expression:\s*(\w+)\*',
-        )
-
         class AssistantTextTap(FrameProcessor):
             """Taps LLM output text before it reaches TTS.
 
             Intercepts tool-call-like text (e.g. ``micro_expression(happy)``)
             that the LLM wrote as content instead of a proper tool call,
             dispatches them, and strips them from the TTS text.
-
-            Emits an AdditionalOutputs with role=assistant so the Gradio
-            chatbot (or LocalStream logger) can display what the bot said.
             """
+
+            _ARG_MAP = {
+                "micro_expression": "expression",
+                "play_emotion": "emotion_name",
+                "move_head": "direction",
+                "dance": "move_name",
+            }
 
             async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
                 await super().process_frame(frame, direction)
                 if isinstance(frame, TTSTextFrame):
                     text = getattr(frame, "text", "")
                     if text:
-                        # Extract and dispatch inlined tool calls
                         text = await self._intercept_tool_text(text)
                         frame.text = text
                         if text.strip():
@@ -820,21 +837,14 @@ class PipecatProvider(ConversationProvider):
 
             async def _intercept_tool_text(self, text: str) -> str:
                 """Find tool-call patterns in text, dispatch them, return cleaned text."""
-                found_any = False
+                calls = _extract_inline_tool_calls(text)
+                if not calls:
+                    return text
 
-                # Pattern 1: micro_expression(happy) style
-                for m in _TOOL_TEXT_RE.finditer(text):
-                    found_any = True
-                    fn_name = m.group(1)
-                    raw_arg = m.group(2).strip().strip("'\"")
-                    if fn_name == "micro_expression":
-                        args_json = json.dumps({"expression": raw_arg})
-                    elif fn_name == "play_emotion":
-                        args_json = json.dumps({"emotion_name": raw_arg})
-                    elif fn_name == "move_head":
-                        args_json = json.dumps({"direction": raw_arg})
-                    elif fn_name == "dance":
-                        args_json = json.dumps({"move_name": raw_arg} if raw_arg else {})
+                for fn_name, raw_arg in calls:
+                    param = self._ARG_MAP.get(fn_name)
+                    if param and raw_arg:
+                        args_json = json.dumps({param: raw_arg})
                     else:
                         args_json = json.dumps({})
                     logger.info("Intercepted text tool call: %s(%s)", fn_name, raw_arg)
@@ -843,27 +853,7 @@ class PipecatProvider(ConversationProvider):
                     except Exception as exc:
                         logger.warning("Intercepted tool call %s failed: %s", fn_name, exc)
 
-                # Pattern 2: *Micro-expression: laugh* style
-                for m in _MARKDOWN_EXPR_RE.finditer(text):
-                    found_any = True
-                    expr = m.group(1).lower()
-                    logger.info("Intercepted markdown expression: %s", expr)
-                    try:
-                        await dispatch_tool_call(
-                            "micro_expression",
-                            json.dumps({"expression": expr}),
-                            provider_ref.deps,
-                        )
-                    except Exception as exc:
-                        logger.warning("Markdown expression %s failed: %s", expr, exc)
-
-                if not found_any:
-                    return text
-
-                # Strip both patterns from the text
-                cleaned = _TOOL_TEXT_RE.sub("", text)
-                cleaned = _MARKDOWN_EXPR_RE.sub("", cleaned).strip()
-                return cleaned
+                return _strip_inline_tool_calls(text)
 
         class PipelineSink(FrameProcessor):
             """Intercepts output frames and bridges them to fastrtc."""
