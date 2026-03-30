@@ -86,11 +86,14 @@ class BreathingMove(Move):  # type: ignore
         self.neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
         self.neutral_antennas = np.array([-0.1745, 0.1745])  # ~10° offset to reduce shaking
 
-        # Breathing parameters
-        self.breathing_z_amplitude = 0.005  # 5mm gentle breathing
-        self.breathing_frequency = 0.1  # Hz (6 breaths per minute)
+        # Breathing parameters — amplitude must be large enough to be
+        # visually noticeable on the physical robot.
+        self.breathing_z_amplitude = 0.012  # 12mm gentle breathing
+        self.breathing_pitch_amplitude = np.deg2rad(3)  # 3° head nod
+        self.breathing_frequency = 0.15  # Hz (~9 breaths per minute)
         self.antenna_sway_amplitude = np.deg2rad(15)  # 15 degrees
         self.antenna_frequency = 0.5  # Hz (faster antenna sway)
+        self._logged_start = False
 
     @property
     def duration(self) -> float:
@@ -118,9 +121,22 @@ class BreathingMove(Move):  # type: ignore
             # Phase 2: Breathing patterns from neutral base
             breathing_time = t - self.interpolation_duration
 
-            # Gentle z-axis breathing
-            z_offset = self.breathing_z_amplitude * np.sin(2 * np.pi * self.breathing_frequency * breathing_time)
-            head_pose = create_head_pose(x=0, y=0, z=z_offset, roll=0, pitch=0, yaw=0, degrees=True, mm=False)
+            if not self._logged_start:
+                self._logged_start = True
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    "BreathingMove: entered phase 2 (continuous), z_amp=%.3f pitch_amp=%.1f°",
+                    self.breathing_z_amplitude, np.rad2deg(self.breathing_pitch_amplitude),
+                )
+
+            # Gentle z-axis + pitch breathing
+            phase = 2 * np.pi * self.breathing_frequency * breathing_time
+            z_offset = self.breathing_z_amplitude * np.sin(phase)
+            pitch_offset = self.breathing_pitch_amplitude * np.sin(phase)
+            head_pose = create_head_pose(
+                x=0, y=0, z=z_offset, roll=0, pitch=np.rad2deg(pitch_offset), yaw=0,
+                degrees=True, mm=False,
+            )
 
             # Antenna sway (opposite directions)
             antenna_sway = self.antenna_sway_amplitude * np.sin(2 * np.pi * self.antenna_frequency * breathing_time)

@@ -336,6 +336,12 @@ class LocalStream:
 
                 from reachy_mini_conversation_app.config import set_custom_profile
 
+                # Remember the profile from the project .env (set at import
+                # time in Config).  If the user explicitly configured a
+                # profile in the project .env, it should take priority over
+                # the instance .env which may contain a stale UI selection.
+                _project_profile = config.REACHY_MINI_CUSTOM_PROFILE
+
                 env_path = Path(self._instance_path) / ".env"
                 if env_path.exists():
                     load_dotenv(dotenv_path=str(env_path), override=True)
@@ -347,12 +353,20 @@ class LocalStream:
                         except Exception:
                             pass
                     if LOCKED_PROFILE is None:
-                        new_profile = os.getenv("REACHY_MINI_CUSTOM_PROFILE")
-                        if new_profile is not None:
+                        if _project_profile is not None:
+                            # Project .env had an explicit profile — keep it
+                            # even if the instance .env has a different value.
                             try:
-                                set_custom_profile(new_profile.strip() or None)
+                                set_custom_profile(_project_profile)
                             except Exception:
-                                pass  # Best-effort profile update
+                                pass
+                        else:
+                            new_profile = os.getenv("REACHY_MINI_CUSTOM_PROFILE")
+                            if new_profile is not None:
+                                try:
+                                    set_custom_profile(new_profile.strip() or None)
+                                except Exception:
+                                    pass  # Best-effort profile update
             except Exception:
                 pass  # Instance .env loading is optional; continue with defaults
 

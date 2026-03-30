@@ -71,6 +71,8 @@ ASR_MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
 # PipelineParams defaults already match: audio_in=16000, audio_out=24000.
 FASTRTC_SAMPLE_RATE = 24000
 PIPELINE_SAMPLE_RATE = 16000
+# Silero VAD expects 512 samples per analysis window at 16 kHz (32 ms).
+VAD_FRAME_SAMPLES = 512
 
 # ---------------------------------------------------------------------------
 # Testable pure functions (extracted from inner FrameProcessor classes)
@@ -489,6 +491,7 @@ class PipecatProvider(ConversationProvider):
         from pipecat.pipeline.task import PipelineTask, PipelineParams
         from pipecat.pipeline.runner import PipelineRunner
         from pipecat.audio.vad.silero import SileroVADAnalyzer
+        from pipecat.audio.vad.vad_analyzer import VADParams
         from pipecat.pipeline.pipeline import Pipeline
         from pipecat.services.openai.llm import OpenAILLMService
         from pipecat.services.openai.stt import OpenAISTTService
@@ -562,8 +565,16 @@ class PipecatProvider(ConversationProvider):
         # VADUserStoppedSpeakingFrame that both the STT service and the
         # user aggregator listen for.
 
+        # min_volume=0.0 disables the EBU R128 volume gate — pipecat's
+        # calculate_audio_volume can return unreliable values on 32 ms
+        # chunks (pyloudnorm -inf on short blocks), which would prevent
+        # VAD from ever triggering.  Silero's neural confidence alone is
+        # a reliable speech detector.
+        _vad_params = VADParams(min_volume=0.0)
         vad = VADProcessor(
-            vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE),
+            vad_analyzer=SileroVADAnalyzer(
+                sample_rate=PIPELINE_SAMPLE_RATE, params=_vad_params,
+            ),
         )
 
         # ---- Tool registration --------------------------------------------
@@ -666,7 +677,13 @@ class PipecatProvider(ConversationProvider):
             logger.info("Noise reduction: noisereduce not installed, skipping (pip install noisereduce)")
 
         class PipelineSource(FrameProcessor):
-            """Pulls audio from the fastrtc inbound queue into the pipeline."""
+            """Pulls audio from the fastrtc inbound queue into the pipeline.
+
+            Rechunks incoming audio into VAD_FRAME_SAMPLES (512) sample
+            frames so every InputAudioRawFrame aligns exactly with
+            Silero VAD's analysis window.  This avoids misaligned
+            chunks that can cause unreliable confidence scores.
+            """
 
             def __init__(self) -> None:
                 super().__init__()
@@ -679,6 +696,8 @@ class PipecatProvider(ConversationProvider):
             async def run(self, task: PipelineTask) -> None:
                 """Background loop that feeds mic audio into the pipeline."""
                 _src_count = 0
+                _chunk_count = 0
+                _leftover = np.array([], dtype=np.int16)
                 logger.info("PipelineSource.run: started, waiting for audio frames")
                 while self._running:
                     try:
@@ -700,13 +719,27 @@ class PipecatProvider(ConversationProvider):
                             _src_count, sr, len(audio),
                         )
 
-                    audio_bytes = audio.tobytes()
-                    frame = InputAudioRawFrame(
-                        audio=audio_bytes,
-                        sample_rate=sr,
-                        num_channels=1,
-                    )
-                    await task.queue_frame(frame)
+                    # Rechunk to VAD_FRAME_SAMPLES-sized pieces for clean
+                    # alignment with Silero VAD's 512-sample analysis window.
+                    if _leftover.size:
+                        audio = np.concatenate((_leftover, audio))
+                        _leftover = np.array([], dtype=np.int16)
+
+                    offset = 0
+                    while offset + VAD_FRAME_SAMPLES <= len(audio):
+                        chunk = audio[offset : offset + VAD_FRAME_SAMPLES]
+                        offset += VAD_FRAME_SAMPLES
+                        _chunk_count += 1
+                        frame = InputAudioRawFrame(
+                            audio=chunk.tobytes(),
+                            sample_rate=sr,
+                            num_channels=1,
+                        )
+                        await task.queue_frame(frame)
+
+                    # Keep remainder for the next iteration
+                    if offset < len(audio):
+                        _leftover = audio[offset:]
 
             def stop(self) -> None:
                 self._running = False
@@ -1629,7 +1662,9 @@ class PipecatProvider(ConversationProvider):
                 settings=OpenAITTSService.Settings(model=TTS_MODEL),
             )
             _vad = VADProcessor(
-                vad_analyzer=SileroVADAnalyzer(sample_rate=PIPELINE_SAMPLE_RATE),
+                vad_analyzer=SileroVADAnalyzer(
+                    sample_rate=PIPELINE_SAMPLE_RATE, params=_vad_params,
+                ),
             )
 
             _intent_router = IntentRouter(_llm)

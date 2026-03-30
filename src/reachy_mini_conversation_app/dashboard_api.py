@@ -104,12 +104,28 @@ def mount_dashboard_routes(
             except Exception:
                 pass
 
+        # Resolve actual model name: prefer the provider's LLM_MODEL
+        # (which has the correct default for local Pipecat pipelines)
+        # over the raw MODEL_NAME env var (whose default is "gpt-realtime").
+        _model_name = os.environ.get("MODEL_NAME", "")
+        if not _model_name or _model_name == "gpt-realtime":
+            try:
+                from reachy_mini_conversation_app.providers.pipecat_provider import LLM_MODEL
+                _model_name = LLM_MODEL
+            except ImportError:
+                pass
+        if not _model_name:
+            _model_name = "unknown"
+        # Shorten long GGUF paths to just the model filename
+        if "/" in _model_name and _model_name.endswith(".gguf"):
+            _model_name = _model_name.rsplit("/", 1)[-1]
+
         return JSONResponse({
             "uptime_s": round(time.time() - _start_time, 1),
             "movement": movement,
             "camera": {"active": camera_active},
             "provider": os.environ.get("PROVIDER", "unknown"),
-            "model": os.environ.get("MODEL_NAME", "unknown"),
+            "model": _model_name,
             "multimodal": os.environ.get("LLM_MULTIMODAL", ""),
             "pipeline": pipeline_health,
         })
@@ -127,9 +143,16 @@ def mount_dashboard_routes(
     # --- GET /api/config ---
     @app.get("/api/config")
     def get_config() -> JSONResponse:
+        _cfg_model = os.environ.get("MODEL_NAME", "")
+        if not _cfg_model or _cfg_model == "gpt-realtime":
+            try:
+                from reachy_mini_conversation_app.providers.pipecat_provider import LLM_MODEL
+                _cfg_model = LLM_MODEL
+            except ImportError:
+                pass
         return JSONResponse({
             "provider": os.environ.get("PROVIDER", "unknown"),
-            "model_name": os.environ.get("MODEL_NAME", ""),
+            "model_name": _cfg_model,
             "llm_base_url": os.environ.get("LLM_BASE_URL", ""),
             "tts_base_url": os.environ.get("TTS_BASE_URL", ""),
             "tts_model": os.environ.get("TTS_MODEL", ""),
