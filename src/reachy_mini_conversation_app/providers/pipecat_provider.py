@@ -613,11 +613,12 @@ class PipecatProvider(ConversationProvider):
         # user aggregator listen for.
 
         # Lower the EBU R128 volume gate from the default 0.6 — pipecat's
-        # calculate_audio_volume can return unreliable values on 32 ms
-        # chunks (pyloudnorm on short blocks).  0.6 blocks all speech;
-        # 0.0 triggers on any noise.  0.1 passes real speech while
-        # filtering very quiet ambient noise to reduce CPU waste.
-        _vad_params = VADParams(min_volume=0.1)
+        # calculate_audio_volume returns unreliable values on 32 ms chunks.
+        # Lean mode: 0.0 — false triggers are cheap (no enrichment overhead)
+        # Full mode: 0.1 — reduces false triggers that waste CPU on
+        #   ParallelEnricher/IntentRouter/AutoMemoryTap processing
+        _vad_min_volume = 0.0 if _is_lean_mode() else 0.1
+        _vad_params = VADParams(min_volume=_vad_min_volume)
         vad = VADProcessor(
             vad_analyzer=SileroVADAnalyzer(
                 sample_rate=PIPELINE_SAMPLE_RATE, params=_vad_params,
