@@ -540,6 +540,9 @@ class PipecatProvider(ConversationProvider):
             settings=OpenAILLMService.Settings(
                 model=LLM_MODEL,
                 system_instruction=get_session_instructions(),
+                # Cap generation to keep responses snappy — with ~5 tok/s
+                # on the current hardware, 150 tokens ≈ 30s max generation.
+                max_tokens=150,
                 # Disable thinking via chat_template_kwargs so the Jinja
                 # template pre-fills an empty <think>\n\n</think> block.
                 # This avoids the 30-90s thinking latency on Qwen3.5.
@@ -566,12 +569,12 @@ class PipecatProvider(ConversationProvider):
         # VADUserStoppedSpeakingFrame that both the STT service and the
         # user aggregator listen for.
 
-        # min_volume=0.0 disables the EBU R128 volume gate — pipecat's
+        # Lower the EBU R128 volume gate from the default 0.6 — pipecat's
         # calculate_audio_volume can return unreliable values on 32 ms
-        # chunks (pyloudnorm -inf on short blocks), which would prevent
-        # VAD from ever triggering.  Silero's neural confidence alone is
-        # a reliable speech detector.
-        _vad_params = VADParams(min_volume=0.0)
+        # chunks (pyloudnorm on short blocks).  0.6 blocks all speech;
+        # 0.0 triggers on any noise.  0.1 passes real speech while
+        # filtering very quiet ambient noise to reduce CPU waste.
+        _vad_params = VADParams(min_volume=0.1)
         vad = VADProcessor(
             vad_analyzer=SileroVADAnalyzer(
                 sample_rate=PIPELINE_SAMPLE_RATE, params=_vad_params,
@@ -1633,6 +1636,7 @@ class PipecatProvider(ConversationProvider):
                 settings=OpenAILLMService.Settings(
                     model=LLM_MODEL,
                     system_instruction=get_session_instructions(),
+                    max_tokens=150,
                     extra={
                         "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
                     },

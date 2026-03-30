@@ -1,11 +1,12 @@
 dance
-stop_dance
 play_emotion
-stop_emotion
 move_head
-camera
-do_nothing
 micro_expression
 store_memory
 recall_memory
-# head_tracking is commented out — CPU-intensive on local hardware
+# Removed to reduce prompt tokens (~600 tokens saved):
+# stop_dance, stop_emotion — rarely needed
+# camera — not useful without multimodal LLM
+# do_nothing — empty tool, wastes tokens
+# task_status, task_cancel — auto-loaded meta-tools, rarely useful
+# head_tracking — CPU-intensive on local hardware
