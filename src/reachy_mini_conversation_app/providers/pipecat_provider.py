@@ -71,8 +71,50 @@ ASR_MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-0.6B")
 # PipelineParams defaults already match: audio_in=16000, audio_out=24000.
 FASTRTC_SAMPLE_RATE = 24000
 PIPELINE_SAMPLE_RATE = 16000
-# Silero VAD expects 512 samples per analysis window at 16 kHz (32 ms).
-VAD_FRAME_SAMPLES = 512
+
+# Pipeline mode: "lean" strips to VAD→STT→LLM→TTS (no tools, no memory,
+# no enrichment) for fast response on constrained hardware.
+# "full" is the default with all companion features.
+PIPELINE_MODE = os.environ.get("PIPELINE_MODE", "full").lower()
+
+
+def _is_lean_mode(mode: str = PIPELINE_MODE) -> bool:
+    """Return True when the pipeline should run in lean (stripped) mode."""
+    return mode == "lean"
+
+
+def _lean_pipeline_processor_names() -> list[str]:
+    """Return the ordered processor class names for the lean pipeline."""
+    return [
+        "VADProcessor",
+        "OpenAISTTService",
+        "ASRTextCleaner",
+        "LLMUserContextAggregator",
+        "OpenAILLMService",
+        "OpenAITTSService",
+        "PipelineSink",
+        "LLMAssistantContextAggregator",
+    ]
+
+
+def _full_pipeline_processor_names() -> list[str]:
+    """Return the ordered processor class names for the full pipeline."""
+    return [
+        "VADProcessor",
+        "OpenAISTTService",
+        "ASRTextCleaner",
+        "LLMUserContextAggregator",
+        "ContextTrimmer",
+        "ParallelEnricher",
+        "IntentRouter",
+        "OpenAILLMService",
+        "AssistantTextTap",
+        "TTSTextChunker",
+        "OpenAITTSService",
+        "PipelineSink",
+        "LLMAssistantContextAggregator",
+        "AutoMemoryTap",
+    ]
 
 # ---------------------------------------------------------------------------
 # Testable pure functions (extracted from inner FrameProcessor classes)
@@ -517,7 +559,8 @@ class PipecatProvider(ConversationProvider):
         _threading.Thread(target=_warm_up_tts, daemon=True, name="tts-warmup").start()
 
         logger.info(
-            "PipecatProvider: building pipeline  LLM=%s@%s  STT=%s@%s  TTS=%s@%s",
+            "PipecatProvider: building pipeline (mode=%s)  LLM=%s@%s  STT=%s@%s  TTS=%s@%s",
+            PIPELINE_MODE,
             LLM_MODEL,
             LLM_BASE_URL,
             ASR_MODEL,
@@ -585,71 +628,76 @@ class PipecatProvider(ConversationProvider):
         # Convert the app's tool specs to OpenAI-compatible format and register
         # a catch-all handler that dispatches to the existing tool registry.
 
-        from pipecat.adapters.schemas.function_schema import FunctionSchema
-        from pipecat.adapters.schemas.tools_schema import ToolsSchema
-        from reachy_mini_conversation_app.tools.core_tools import (
-            get_tool_specs,
-            dispatch_tool_call,
-        )
+        # ---- Tool registration (full mode only) ----------------------------
+        openai_tools = None
+        _handle_tool_call = None
 
-        tool_specs = get_tool_specs()
-        # Convert app tool specs to pipecat FunctionSchema objects
-        function_schemas = []
-        for spec in tool_specs:
-            params = spec.get("parameters", {})
-            function_schemas.append(FunctionSchema(
-                name=spec["name"],
-                description=spec.get("description", ""),
-                properties=params.get("properties", {}),
-                required=params.get("required", []),
-            ))
-        openai_tools = ToolsSchema(standard_tools=function_schemas)
+        if not _is_lean_mode():
+            from pipecat.adapters.schemas.function_schema import FunctionSchema
+            from pipecat.adapters.schemas.tools_schema import ToolsSchema
+            from reachy_mini_conversation_app.tools.core_tools import (
+                get_tool_specs,
+                dispatch_tool_call,
+            )
 
-        provider_ref_for_tools = self
+            tool_specs = get_tool_specs()
+            # Convert app tool specs to pipecat FunctionSchema objects
+            function_schemas = []
+            for spec in tool_specs:
+                params = spec.get("parameters", {})
+                function_schemas.append(FunctionSchema(
+                    name=spec["name"],
+                    description=spec.get("description", ""),
+                    properties=params.get("properties", {}),
+                    required=params.get("required", []),
+                ))
+            openai_tools = ToolsSchema(standard_tools=function_schemas)
 
-        async def _handle_tool_call(params) -> None:
-            """Catch-all handler for all pipecat function calls."""
-            fn_name = params.function_name
-            arguments = params.arguments
-            tool_call_id = params.tool_call_id
+            provider_ref_for_tools = self
 
-            logger.info("Tool call: %s(%s) [%s]", fn_name, arguments, tool_call_id)
+            async def _handle_tool_call(params) -> None:
+                """Catch-all handler for all pipecat function calls."""
+                fn_name = params.function_name
+                arguments = params.arguments
+                tool_call_id = params.tool_call_id
 
-            # pipecat passes arguments as a dict (Mapping), but
-            # dispatch_tool_call expects a JSON string.
-            args_json = json.dumps(arguments) if isinstance(arguments, dict) else str(arguments)
-            try:
-                result = await dispatch_tool_call(fn_name, args_json, provider_ref_for_tools.deps)
-            except Exception as exc:
-                logger.exception("Tool call %s failed", fn_name)
-                result = {"error": str(exc)}
+                logger.info("Tool call: %s(%s) [%s]", fn_name, arguments, tool_call_id)
 
-            await params.result_callback(json.dumps(result))
-
-            # Notify UI about tool usage — skip for tools that produce
-            # their own audio (micro_expression) to avoid the result text
-            # being read aloud by TTS or shown as a spurious transcript.
-            _silent_tools = {"micro_expression", "play_emotion", "do_nothing"}
-            if fn_name not in _silent_tools:
+                # pipecat passes arguments as a dict (Mapping), but
+                # dispatch_tool_call expects a JSON string.
+                args_json = json.dumps(arguments) if isinstance(arguments, dict) else str(arguments)
                 try:
-                    provider_ref_for_tools.output_queue.put_nowait(
-                        AdditionalOutputs({"role": "assistant", "content": f"Tool {fn_name}: {result}"})
-                    )
-                except asyncio.QueueFull:
-                    pass  # UI notification drop is acceptable
+                    result = await dispatch_tool_call(fn_name, args_json, provider_ref_for_tools.deps)
+                except Exception as exc:
+                    logger.exception("Tool call %s failed", fn_name)
+                    result = {"error": str(exc)}
 
-        # Register catch-all (function_name=None handles all tool calls)
-        llm.register_function(None, _handle_tool_call)
+                await params.result_callback(json.dumps(result))
 
-        logger.info("Registered %d tools with LLM: %s",
-                     len(tool_specs), [s["name"] for s in tool_specs])
+                # Notify UI about tool usage — skip for tools that produce
+                # their own audio (micro_expression) to avoid the result text
+                # being read aloud by TTS or shown as a spurious transcript.
+                _silent_tools = {"micro_expression", "play_emotion", "do_nothing"}
+                if fn_name not in _silent_tools:
+                    try:
+                        provider_ref_for_tools.output_queue.put_nowait(
+                            AdditionalOutputs({"role": "assistant", "content": f"Tool {fn_name}: {result}"})
+                        )
+                    except asyncio.QueueFull:
+                        pass  # UI notification drop is acceptable
+
+            # Register catch-all (function_name=None handles all tool calls)
+            llm.register_function(None, _handle_tool_call)
+
+            logger.info("Registered %d tools with LLM: %s",
+                         len(tool_specs), [s["name"] for s in tool_specs])
+        else:
+            logger.info("Pipeline mode: lean — no tools registered")
 
         # ---- Context & aggregators ---------------------------------------
 
         context = LLMContext(tools=openai_tools)
 
-        # MinWords turn start strategy: require N words to interrupt the bot.
-        # Single-word backchannel ("yeah", "uh-huh") won't interrupt.
         from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
             MinWordsUserTurnStartStrategy,
         )
@@ -1543,21 +1591,30 @@ class PipecatProvider(ConversationProvider):
         else:
             logger.info("VisionInjector: disabled (text-only LLM, no VisionProcessor)")
 
-        context_trimmer = ContextTrimmer()
-        parallel_enricher = ParallelEnricher(multimodal=_is_multimodal)
-        intent_router = IntentRouter(llm)
-        tts_chunker = TTSTextChunker(max_chars=80)
-        text_tap = AssistantTextTap()
         sink = PipelineSink()
-        auto_memory = AutoMemoryTap()
 
         logger.info(
             "SmartTurn: using pipecat built-in LocalSmartTurnAnalyzerV3 "
             "(bundled ONNX model, runs on-device)"
         )
 
-        pipeline = Pipeline(
-            [
+        if _is_lean_mode():
+            # Lean pipeline: VAD → STT → ASRCleaner → UserAgg → LLM → TTS → Sink → AssistantAgg
+            logger.info("Pipeline mode: lean — 8 processors, no tools/memory/enrichment")
+            pipeline = Pipeline([
+                vad, stt, asr_cleaner, user_agg,
+                llm, tts, sink, assistant_agg,
+            ])
+        else:
+            # Full pipeline with all companion features
+            context_trimmer = ContextTrimmer()
+            parallel_enricher = ParallelEnricher(multimodal=_is_multimodal)
+            intent_router = IntentRouter(llm)
+            tts_chunker = TTSTextChunker(max_chars=80)
+            text_tap = AssistantTextTap()
+            auto_memory = AutoMemoryTap()
+
+            pipeline = Pipeline([
                 vad,               # analyse audio for speech boundaries
                 stt,               # transcribe speech segments
                 asr_cleaner,       # strip <asr_text> prefix + noise filter
@@ -1572,8 +1629,7 @@ class PipecatProvider(ConversationProvider):
                 sink,             # bridge audio + transcripts → fastrtc
                 assistant_agg,    # accumulate assistant turns
                 auto_memory,      # auto-store conversation facts to Mem0
-            ]
-        )
+            ])
 
         # Create metrics observer
         metrics_observer = _PipelineMetricsObserver(self)
@@ -1608,12 +1664,7 @@ class PipecatProvider(ConversationProvider):
             """
             _source = PipelineSource()
             _asr_cleaner = ASRTextCleaner()
-            _parallel_enricher = ParallelEnricher(multimodal=_is_multimodal)
-            _context_trimmer = ContextTrimmer()
-            _tts_chunker = TTSTextChunker(max_chars=80)
-            _text_tap = AssistantTextTap()
             _sink = PipelineSink()
-            _auto_memory = AutoMemoryTap()
             _context = LLMContext(tools=openai_tools)
             _user_params = LLMUserAggregatorParams(
                 user_turn_strategies=UserTurnStrategies(
@@ -1642,7 +1693,8 @@ class PipecatProvider(ConversationProvider):
                     },
                 ),
             )
-            _llm.register_function(None, _handle_tool_call)
+            if _handle_tool_call is not None:
+                _llm.register_function(None, _handle_tool_call)
             _tts = OpenAITTSService(
                 api_key="not-needed",
                 base_url=TTS_BASE_URL,
@@ -1654,13 +1706,24 @@ class PipecatProvider(ConversationProvider):
                 ),
             )
 
-            _intent_router = IntentRouter(_llm)
-            _pipeline = Pipeline([
-                _vad, _stt, _asr_cleaner, _user_agg, _context_trimmer,
-                _parallel_enricher, _intent_router, _llm,
-                _text_tap, _tts_chunker, _tts, _sink, _assistant_agg,
-                _auto_memory,
-            ])
+            if _is_lean_mode():
+                _pipeline = Pipeline([
+                    _vad, _stt, _asr_cleaner, _user_agg,
+                    _llm, _tts, _sink, _assistant_agg,
+                ])
+            else:
+                _parallel_enricher = ParallelEnricher(multimodal=_is_multimodal)
+                _context_trimmer = ContextTrimmer()
+                _tts_chunker = TTSTextChunker(max_chars=80)
+                _text_tap = AssistantTextTap()
+                _auto_memory = AutoMemoryTap()
+                _intent_router = IntentRouter(_llm)
+                _pipeline = Pipeline([
+                    _vad, _stt, _asr_cleaner, _user_agg, _context_trimmer,
+                    _parallel_enricher, _intent_router, _llm,
+                    _text_tap, _tts_chunker, _tts, _sink, _assistant_agg,
+                    _auto_memory,
+                ])
             _task = PipelineTask(
                 _pipeline,
                 params=PipelineParams(
@@ -1797,6 +1860,8 @@ class PipecatProvider(ConversationProvider):
     async def send_idle_signal(self, idle_duration: float) -> None:
         """Send an idle nudge to the LLM so the robot does something.
 
+        Skipped in lean mode (no tools available for the LLM to call).
+
         Injects a synthetic system message into the pipeline so the LLM
         can initiate interaction (dance, comment on scene, greet, etc.).
 
@@ -1806,6 +1871,8 @@ class PipecatProvider(ConversationProvider):
           >120s   → reduce frequency (cooldown in emit() handles this)
         """
         if self._pipeline_task is None:
+            return
+        if _is_lean_mode():
             return
 
         # Get scene description if vision is available

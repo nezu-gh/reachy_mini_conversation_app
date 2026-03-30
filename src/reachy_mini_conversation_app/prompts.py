@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 PROMPTS_LIBRARY_DIRECTORY = Path(__file__).parent / "prompts"
 INSTRUCTIONS_FILENAME = "instructions.txt"
+INSTRUCTIONS_LEAN_FILENAME = "instructions_lean.txt"
 VOICE_FILENAME = "voice.txt"
 
 
@@ -59,7 +60,15 @@ def _expand_prompt_includes(content: str) -> str:
 
 
 def get_session_instructions() -> str:
-    """Get session instructions, loading from REACHY_MINI_CUSTOM_PROFILE if set."""
+    """Get session instructions, loading from REACHY_MINI_CUSTOM_PROFILE if set.
+
+    When PIPELINE_MODE=lean, loads the lean prompt variant
+    (instructions_lean.txt) from the active profile if it exists,
+    falling back to a built-in minimal prompt.
+    """
+    import os
+    lean_mode = os.environ.get("PIPELINE_MODE", "full").lower() == "lean"
+
     profile = config.REACHY_MINI_CUSTOM_PROFILE
     if not profile:
         logger.info(f"Loading default prompt from {PROMPTS_LIBRARY_DIRECTORY / 'default_prompt.txt'}")
@@ -74,6 +83,17 @@ def get_session_instructions() -> str:
         else:
             logger.info(f"Loading prompt from profile '{profile}'")
         instructions_file = config.PROFILES_DIRECTORY / profile / INSTRUCTIONS_FILENAME
+
+    # In lean mode, prefer the lean prompt variant if available
+    if lean_mode and profile:
+        lean_file = config.PROFILES_DIRECTORY / profile / INSTRUCTIONS_LEAN_FILENAME
+        if lean_file.exists():
+            logger.info("Pipeline mode: lean — loading %s", lean_file.name)
+            instructions_file = lean_file
+        else:
+            logger.info("Pipeline mode: lean — no lean prompt found, using standard")
+    elif lean_mode:
+        logger.info("Pipeline mode: lean — no profile set, using default prompt")
 
     try:
         if instructions_file.exists():
