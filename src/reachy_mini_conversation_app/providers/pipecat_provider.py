@@ -102,7 +102,7 @@ def _is_noise(text: str) -> bool:
     return False
 
 
-def _trim_context(messages: list[dict], max_turns: int = 40) -> list[dict] | None:
+def _trim_context(messages: list[dict], max_turns: int = 16) -> list[dict] | None:
     """Trim old non-system messages if the context exceeds *max_turns*.
 
     Returns the trimmed list, or ``None`` if no trimming was needed.
@@ -119,9 +119,10 @@ _TOOL_TEXT_RE = re.compile(
     r'(micro_expression|play_emotion|move_head|dance|stop_dance|stop_emotion|do_nothing)'
     r'\(([^)]*)\)',
 )
-# Markdown-style: "*Micro-expression: laugh*"
+# Markdown/bracket/paren style micro-expression references:
+#   *Micro-expression: laugh*   [micro_expression: happy]   (Micro expression: sad)
 _MARKDOWN_EXPR_RE = re.compile(
-    r'\*[Mm]icro[- _]expression:\s*(\w+)\*',
+    r'[\*\[\(][Mm]icro[- _]expression:?\s*(\w+)[\*\]\)]',
 )
 
 
@@ -622,13 +623,17 @@ class PipecatProvider(ConversationProvider):
 
             await params.result_callback(json.dumps(result))
 
-            # Notify UI about tool usage
-            try:
-                provider_ref_for_tools.output_queue.put_nowait(
-                    AdditionalOutputs({"role": "assistant", "content": f"Tool {fn_name}: {result}"})
-                )
-            except asyncio.QueueFull:
-                pass  # UI notification drop is acceptable
+            # Notify UI about tool usage — skip for tools that produce
+            # their own audio (micro_expression) to avoid the result text
+            # being read aloud by TTS or shown as a spurious transcript.
+            _silent_tools = {"micro_expression", "play_emotion", "do_nothing"}
+            if fn_name not in _silent_tools:
+                try:
+                    provider_ref_for_tools.output_queue.put_nowait(
+                        AdditionalOutputs({"role": "assistant", "content": f"Tool {fn_name}: {result}"})
+                    )
+                except asyncio.QueueFull:
+                    pass  # UI notification drop is acceptable
 
         # Register catch-all (function_name=None handles all tool calls)
         llm.register_function(None, _handle_tool_call)
@@ -1560,7 +1565,7 @@ class PipecatProvider(ConversationProvider):
         context_trimmer = ContextTrimmer()
         parallel_enricher = ParallelEnricher(multimodal=_is_multimodal)
         intent_router = IntentRouter(llm)
-        tts_chunker = TTSTextChunker(max_chars=80)
+        tts_chunker = TTSTextChunker(max_chars=40)
         text_tap = AssistantTextTap()
         sink = PipelineSink()
         auto_memory = AutoMemoryTap()
@@ -1624,7 +1629,7 @@ class PipecatProvider(ConversationProvider):
             _asr_cleaner = ASRTextCleaner()
             _parallel_enricher = ParallelEnricher(multimodal=_is_multimodal)
             _context_trimmer = ContextTrimmer()
-            _tts_chunker = TTSTextChunker(max_chars=80)
+            _tts_chunker = TTSTextChunker(max_chars=40)
             _text_tap = AssistantTextTap()
             _sink = PipelineSink()
             _auto_memory = AutoMemoryTap()

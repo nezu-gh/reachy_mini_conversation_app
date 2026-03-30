@@ -78,27 +78,27 @@ class TestTrimContext:
         assert _trim_context(msgs) is None
 
     def test_at_limit_returns_none(self):
-        msgs = [{"role": "user", "content": f"msg {i}"} for i in range(40)]
+        msgs = [{"role": "user", "content": f"msg {i}"} for i in range(16)]
         assert _trim_context(msgs) is None
 
     def test_over_limit_trims(self):
-        msgs = [{"role": "user", "content": f"msg {i}"} for i in range(50)]
+        msgs = [{"role": "user", "content": f"msg {i}"} for i in range(30)]
         result = _trim_context(msgs)
         assert result is not None
-        assert len(result) == 40
-        # Should keep the last 40
-        assert result[0]["content"] == "msg 10"
-        assert result[-1]["content"] == "msg 49"
+        assert len(result) == 16
+        # Should keep the last 16
+        assert result[0]["content"] == "msg 14"
+        assert result[-1]["content"] == "msg 29"
 
     def test_preserves_system_messages(self):
         system = [{"role": "system", "content": "You are a robot."}]
-        user_msgs = [{"role": "user", "content": f"msg {i}"} for i in range(50)]
+        user_msgs = [{"role": "user", "content": f"msg {i}"} for i in range(30)]
         result = _trim_context(system + user_msgs)
         assert result is not None
         assert result[0]["role"] == "system"
         assert result[0]["content"] == "You are a robot."
-        # system + 40 non-system = 41 total
-        assert len(result) == 41
+        # system + 16 non-system = 17 total
+        assert len(result) == 17
 
     def test_preserves_multiple_system_messages(self):
         system = [
@@ -108,7 +108,7 @@ class TestTrimContext:
         user_msgs = [{"role": "user", "content": f"msg {i}"} for i in range(50)]
         result = _trim_context(system + user_msgs)
         assert result is not None
-        assert len(result) == 42  # 2 system + 40 non-system
+        assert len(result) == 18  # 2 system + 16 non-system
         assert result[0]["content"] == "instruction 1"
         assert result[1]["content"] == "instruction 2"
 
