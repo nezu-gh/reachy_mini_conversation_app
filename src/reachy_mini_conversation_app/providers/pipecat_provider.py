@@ -102,7 +102,7 @@ def _is_noise(text: str) -> bool:
     return False
 
 
-def _trim_context(messages: list[dict], max_turns: int = 16) -> list[dict] | None:
+def _trim_context(messages: list[dict], max_turns: int = 40) -> list[dict] | None:
     """Trim old non-system messages if the context exceeds *max_turns*.
 
     Returns the trimmed list, or ``None`` if no trimming was needed.
@@ -682,13 +682,7 @@ class PipecatProvider(ConversationProvider):
             logger.info("Noise reduction: noisereduce not installed, skipping (pip install noisereduce)")
 
         class PipelineSource(FrameProcessor):
-            """Pulls audio from the fastrtc inbound queue into the pipeline.
-
-            Rechunks incoming audio into VAD_FRAME_SAMPLES (512) sample
-            frames so every InputAudioRawFrame aligns exactly with
-            Silero VAD's analysis window.  This avoids misaligned
-            chunks that can cause unreliable confidence scores.
-            """
+            """Pulls audio from the fastrtc inbound queue into the pipeline."""
 
             def __init__(self) -> None:
                 super().__init__()
@@ -701,8 +695,6 @@ class PipecatProvider(ConversationProvider):
             async def run(self, task: PipelineTask) -> None:
                 """Background loop that feeds mic audio into the pipeline."""
                 _src_count = 0
-                _chunk_count = 0
-                _leftover = np.array([], dtype=np.int16)
                 logger.info("PipelineSource.run: started, waiting for audio frames")
                 while self._running:
                     try:
@@ -724,27 +716,13 @@ class PipecatProvider(ConversationProvider):
                             _src_count, sr, len(audio),
                         )
 
-                    # Rechunk to VAD_FRAME_SAMPLES-sized pieces for clean
-                    # alignment with Silero VAD's 512-sample analysis window.
-                    if _leftover.size:
-                        audio = np.concatenate((_leftover, audio))
-                        _leftover = np.array([], dtype=np.int16)
-
-                    offset = 0
-                    while offset + VAD_FRAME_SAMPLES <= len(audio):
-                        chunk = audio[offset : offset + VAD_FRAME_SAMPLES]
-                        offset += VAD_FRAME_SAMPLES
-                        _chunk_count += 1
-                        frame = InputAudioRawFrame(
-                            audio=chunk.tobytes(),
-                            sample_rate=sr,
-                            num_channels=1,
-                        )
-                        await task.queue_frame(frame)
-
-                    # Keep remainder for the next iteration
-                    if offset < len(audio):
-                        _leftover = audio[offset:]
+                    audio_bytes = audio.tobytes()
+                    frame = InputAudioRawFrame(
+                        audio=audio_bytes,
+                        sample_rate=sr,
+                        num_channels=1,
+                    )
+                    await task.queue_frame(frame)
 
             def stop(self) -> None:
                 self._running = False
@@ -1565,7 +1543,7 @@ class PipecatProvider(ConversationProvider):
         context_trimmer = ContextTrimmer()
         parallel_enricher = ParallelEnricher(multimodal=_is_multimodal)
         intent_router = IntentRouter(llm)
-        tts_chunker = TTSTextChunker(max_chars=40)
+        tts_chunker = TTSTextChunker(max_chars=80)
         text_tap = AssistantTextTap()
         sink = PipelineSink()
         auto_memory = AutoMemoryTap()
@@ -1629,7 +1607,7 @@ class PipecatProvider(ConversationProvider):
             _asr_cleaner = ASRTextCleaner()
             _parallel_enricher = ParallelEnricher(multimodal=_is_multimodal)
             _context_trimmer = ContextTrimmer()
-            _tts_chunker = TTSTextChunker(max_chars=40)
+            _tts_chunker = TTSTextChunker(max_chars=80)
             _text_tap = AssistantTextTap()
             _sink = PipelineSink()
             _auto_memory = AutoMemoryTap()
