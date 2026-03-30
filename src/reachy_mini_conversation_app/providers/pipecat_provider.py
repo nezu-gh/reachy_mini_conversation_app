@@ -696,7 +696,10 @@ class PipecatProvider(ConversationProvider):
 
         # ---- Context & aggregators ---------------------------------------
 
-        context = LLMContext(tools=openai_tools)
+        if openai_tools is not None:
+            context = LLMContext(tools=openai_tools)
+        else:
+            context = LLMContext()
 
         from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
             MinWordsUserTurnStartStrategy,
@@ -1665,7 +1668,10 @@ class PipecatProvider(ConversationProvider):
             _source = PipelineSource()
             _asr_cleaner = ASRTextCleaner()
             _sink = PipelineSink()
-            _context = LLMContext(tools=openai_tools)
+            if openai_tools is not None:
+                _context = LLMContext(tools=openai_tools)
+            else:
+                _context = LLMContext()
             _user_params = LLMUserAggregatorParams(
                 user_turn_strategies=UserTurnStrategies(
                     start=[MinWordsUserTurnStartStrategy(min_words=_min_interrupt_words)],
